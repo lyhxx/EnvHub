@@ -1,0 +1,62 @@
+{
+  "name": "envhub",
+  "version": "0.2.0",
+  "productName": "EnvHub",
+  "description": "A local development environment manager for Windows",
+  "main": "out/main/index.js",
+  "author": "EnvHub",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node scripts/dev.cjs",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "dist": "npm run build && node scripts/dist.cjs"
+  },
+  "dependencies": {
+    "extract-zip": "^2.0.1",
+    "vue": "^3.5.43"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@vitejs/plugin-vue": "^6.0.2",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^5.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2",
+    "vue-tsc": "^3.1.1"
+  },
+  "build": {
+    "appId": "cn.javai.envhub",
+    "productName": "EnvHub",
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "executableName": "EnvHub",
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
