@@ -38,29 +38,21 @@ jobs:
         run: npm ci
 
       # 与本地同一条路径：npm run dist = 类型检查 + 构建 + electron-builder
-      # （scripts/dist.cjs 在 CI 上不设国内镜像，直接用 GitHub）
+      # （scripts/dist.cjs 在 CI 上不设国内镜像、也不让 electron-builder 自己发布）
       - name: 构建安装版与绿色版
-        shell: pwsh
-        env:
-          DEBUG: electron-builder
-        run: |
-          npm run dist 2>&1 | Tee-Object -FilePath build-log.txt
-          if ($LASTEXITCODE -ne 0) { throw "打包失败，末尾日志已记录到 build-log.txt" }
+        run: npm run dist
 
-      # 失败时把日志尾部推到 ci-logs 分支，便于在没有日志访问权限时排查（修好后可删）
-      - name: 失败时归档打包日志
-        if: failure()
+      - name: 检查产物
         shell: pwsh
         run: |
-          if (-not (Test-Path build-log.txt)) { "没有日志文件"; exit 0 }
-          $tail = (Get-Content build-log.txt -Tail 400) -join "`n"
-          Set-Content -Path build-failure.log -Value $tail -Encoding utf8
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan ci-logs
-          git add -f build-failure.log
-          git commit -m "ci: 打包失败日志 ${{ github.sha }}"
-          git push -f origin ci-logs
+          $expected = @(
+            "release/EnvHub-$env:VERSION-setup.exe",
+            "release/EnvHub-$env:VERSION-portable.exe"
+          )
+          foreach ($file in $expected) {
+            if (-not (Test-Path $file)) { throw "缺少产物：$file" }
+            "产物 $(Split-Path $file -Leaf)：$((Get-Item $file).Length) 字节"
+          }
 
       - name: 检查产物
         shell: pwsh

@@ -243,6 +243,10 @@ src/
 
 自动发布：推送 `v*` 标签触发 `.github/workflows/release.yml`，在 GitHub 上构建两个产物并创建 Release；发布说明由 `scripts/release-notes.cjs` 从 `CHANGELOG.md` 抽取该版本条目生成（去掉"已知限制"，并在开头列出两个下载文件），因此**发版前必须先在 CHANGELOG 写好对应版本**。工作流会校验标签与 `package.json` 版本一致，重复运行同一标签时覆盖已有产物与说明。
 
+`scripts/dist.cjs` 用 `--publish never` 调用 electron-builder：只打包、不发布。electron-builder 会从 git 远端识别出 GitHub 仓库并自行尝试发布，在没有 `GH_TOKEN` 的环境下会在产物构建完成后报错退出，导致构建步骤被判失败——发布统一交给工作流的 `gh release`。
+
+日常校验：`.github/workflows/build.yml` 在推送到 `main` 与 PR 时跑类型检查与编译（`npm ci --ignore-scripts`，不需要 Electron 二进制），README 顶部的 build 徽章即来自它。
+
 版本号维护：
 
 1. 修改 `package.json` 的 `version`；

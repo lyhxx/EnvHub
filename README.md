@@ -3,9 +3,10 @@
 Windows 本地开发环境管理器。集中查看本机已安装的运行时与版本、切换默认版本、按官方源下载安装新版本，并读写包管理器使用的镜像与缓存配置。
 
 <p align="center">
+  <a href="https://github.com/lyhxx/EnvHub/actions/workflows/build.yml"><img src="https://github.com/lyhxx/EnvHub/actions/workflows/build.yml/badge.svg" alt="build"></a>
+  <a href="https://github.com/lyhxx/EnvHub/releases"><img src="https://img.shields.io/github/v/release/lyhxx/EnvHub" alt="release"></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078d4" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version">
 </p>
 
 ---
