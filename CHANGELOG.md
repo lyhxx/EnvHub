@@ -14,6 +14,7 @@
 - 版本号宽松比较：按前导数字段比较并允许一段是另一段的前缀，解决官方发布名与本地实际报出不一致（例如 Temurin 目录名 `21.0.12.1+1` 与 `java -version` 的 `21.0.12.1`）导致的误判与"版本待确认"。
 - 安装标记：安装前写入 `state: "installing"`，完成后改为 `"ready"`。
 - 环境搜索补上工具关键词（`relatedTools`）：`mvn`、`cargo`、`pip` 之类也能命中对应环境。
+- 免安装绿色版：打包额外产出单文件 `EnvHub-<版本>-portable.exe`，双击即用；配置与运行时数据仍存放在用户目录，与安装版共用同一份。
 
 ### 变更
 
@@ -25,6 +26,7 @@
 - 版本源请求增加 15 秒超时；全部来源失败时不再静默返回空列表，而是抛出可读错误（单个来源失败仍保留其余结果，直链不丢）。
 - Maven 的发行包与校验值改为优先取 Maven Central（永久保留、速度快），失败回退 Apache 归档；PHP 的下载基址改为跟随官方重定向结果，不再写死。
 - 每个环境的可执行文件信息合并到 `src/shared/executables.ts`（原来分散在主进程两处），新增环境只需登记一次。
+- 打 `v*` 标签会由 GitHub Actions 自动构建安装版与绿色版并发布 Release，发布说明由 `scripts/release-notes.cjs` 从 CHANGELOG 抽取生成；CI 上不设国内镜像，本地打包仍走镜像。
 - 不再扫描 `previousManagedRoot`；卸载允许当前与上一个数据目录下的托管版本，前缀比较带分隔符。
 - 数据目录拒绝驱动器根目录与系统目录（Windows / Program Files / ProgramData / Users / System32）。
 - 用户 PATH 中的引号条目按去引号处理：既不漏识别，也不会被「修复 PATH」误删。

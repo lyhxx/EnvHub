@@ -1,0 +1,67 @@
+name: Release
+
+# 打 v* 标签即自动构建 Windows 安装包并发布到 Releases；
+# 发布说明从 CHANGELOG.md 对应版本的条目生成，无需手工维护。
+# 也可以在 Actions 页面手动触发（仅构建，不发布）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 校验标签与 package.json 版本一致
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("${{ github.ref_type }}" -eq "tag") {
+            if ("v$version" -ne "${{ github.ref_name }}") {
+              throw "标签 ${{ github.ref_name }} 与 package.json 的版本 $version 不一致"
+            }
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查与构建
+        run: npm run build
+
+      # 不指定 target，按 package.json 配置构建安装版与绿色版（CI 上不设国内镜像，直接用 GitHub）
+      - name: 打安装包与绿色版
+        run: npx electron-builder --win
+
+      - name: 生成发布说明
+        run: node scripts/release-notes.cjs $env:VERSION --out release-notes.md
+
+      - name: 发布到 Releases
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "v$env:VERSION"
+          $assets = @(
+            "release/EnvHub-$env:VERSION-setup.exe",
+            "release/EnvHub-$env:VERSION-portable.exe"
+          )
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $assets --clobber
+            gh release edit $tag --notes-file release-notes.md
+          } else {
+            gh release create $tag $assets --title "EnvHub $env:VERSION" --notes-file release-notes.md
+          }

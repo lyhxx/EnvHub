@@ -16,7 +16,7 @@
 | `npm run dev` | 开发模式。`scripts/dev.cjs` 会在 `node_modules/.cache/envhub-dev-electron/` 生成一份把名称/图标改为 EnvHub 的 Electron 宿主副本，再通过 `ELECTRON_EXEC_PATH` 启动，避免任务栏显示 "Electron" |
 | `npm run typecheck` | 主进程 + 渲染进程类型检查 |
 | `npm run build` | 类型检查后编译到 `out/` |
-| `npm run dist` | 编译并生成 NSIS 安装包到 `release/` |
+| `npm run dist` | 编译并生成安装版与绿色版到 `release/` |
 
 调试提示：
 
@@ -238,13 +238,17 @@ src/
 
 - `appId`: `cn.javai.envhub`；
 - 安装包图标：`build/icon.ico`（随窗口图标一起使用，打包时通过 `extraResources` 复制到 `resources/icon.ico`）；
-- 目标：NSIS（`oneClick: false`，允许选择安装目录），产物 `release/EnvHub-<version>-setup.exe`。
+- 目标两个：NSIS（`oneClick: false`，允许选择安装目录）与 portable（免安装单文件）。产物名按目标区分：`release/EnvHub-<version>-setup.exe`、`release/EnvHub-<version>-portable.exe`。
+- 本地打包走国内镜像（`scripts/dist.cjs` 设置 `ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR`）；CI 上会自动跳过，直接用 GitHub。
+
+自动发布：推送 `v*` 标签触发 `.github/workflows/release.yml`，在 GitHub 上构建两个产物并创建 Release；发布说明由 `scripts/release-notes.cjs` 从 `CHANGELOG.md` 抽取该版本条目生成（去掉"已知限制"，并在开头列出两个下载文件），因此**发版前必须先在 CHANGELOG 写好对应版本**。工作流会校验标签与 `package.json` 版本一致，重复运行同一标签时覆盖已有产物与说明。
 
 版本号维护：
 
 1. 修改 `package.json` 的 `version`；
 2. 同步 `src/shared/appInfo.ts` 的 `APP_VERSION`（侧栏展示用）；
-3. 在 `CHANGELOG.md` 增加对应版本记录。
+3. 在 `CHANGELOG.md` 增加对应版本记录；
+4. 提交后打并推送标签（`git tag v<版本> && git push origin v<版本>`）。
 
 未接入代码签名：正式对外分发前需要配置证书，否则 SmartScreen 会提示未知发布者。
 
