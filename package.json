@@ -46,7 +46,7 @@
     "win": {
       "icon": "build/icon.ico",
       "executableName": "EnvHub",
-      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "artifactName": "${productName}-${version}-win-${arch}.${ext}",
       "target": [
         {
           "target": "nsis",
@@ -56,6 +56,12 @@
         },
         {
           "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
           "arch": [
             "x64"
           ]

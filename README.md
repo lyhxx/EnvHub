@@ -74,9 +74,10 @@ EnvHub 把这些收进一个界面：扫描出本机有什么、把某个版本�
 | 类型 | 文件名 | 说明 |
 | --- | --- | --- |
 | 安装版 | `EnvHub-0.3.0-setup.exe` | 安装到系统，可自选安装目录，创建开始菜单快捷方式 |
-| 绿色版 | `EnvHub-0.3.0-portable.exe` | 免安装，双击即用；配置与运行时数据仍保存在用户目录，与安装版共用同一份 |
+| 绿色单文件 | `EnvHub-0.3.0-portable.exe` | 免安装，双击即用 |
+| 绿色解压版 | `EnvHub-0.3.0-win-x64.zip` | 免安装，解压后运行其中的 `EnvHub.exe` |
 
-系统要求：Windows 10 / 11（x64）。程序自带运行时，无需另外安装 Node.js、.NET 或 Python。
+三个版本的配置与运行时数据都保存在用户目录（`%APPDATA%\EnvHub` 与 `%LOCALAPPDATA%\EnvHub`），互相共用同一份；系统要求 Windows 10 / 11（x64），程序自带运行时，无需另外安装 Node.js、.NET 或 Python。
 
 ## 使用
 

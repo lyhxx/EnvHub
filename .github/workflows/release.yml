@@ -1,7 +1,7 @@
 name: Release
 
-# 打 v* 标签即自动构建 Windows 安装包（安装版 + 绿色版）并发布到 Releases；
-# 发布说明从 CHANGELOG.md 对应版本的条目生成，无需手工维护。
+# 打 v* 标签即自动构建三份 Windows 产物（安装版 / 绿色单文件 / 绿色解压版）并发布到 Releases；
+# 发布说明从 CHANGELOG.md 的「概述 + 亮点」生成，无需手工维护。
 # 也可以在 Actions 页面手动触发（仅构建，不发布，用于验证打包）。
 on:
   push:
@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   release:
@@ -39,7 +40,7 @@ jobs:
 
       # 与本地同一条路径：npm run dist = 类型检查 + 构建 + electron-builder
       # （scripts/dist.cjs 在 CI 上不设国内镜像、也不让 electron-builder 自己发布）
-      - name: 构建安装版与绿色版
+      - name: 构建三份产物
         run: npm run dist
 
       - name: 检查产物
@@ -47,19 +48,8 @@ jobs:
         run: |
           $expected = @(
             "release/EnvHub-$env:VERSION-setup.exe",
-            "release/EnvHub-$env:VERSION-portable.exe"
-          )
-          foreach ($file in $expected) {
-            if (-not (Test-Path $file)) { throw "缺少产物：$file" }
-            "产物 $(Split-Path $file -Leaf)：$((Get-Item $file).Length) 字节"
-          }
-
-      - name: 检查产物
-        shell: pwsh
-        run: |
-          $expected = @(
-            "release/EnvHub-$env:VERSION-setup.exe",
-            "release/EnvHub-$env:VERSION-portable.exe"
+            "release/EnvHub-$env:VERSION-portable.exe",
+            "release/EnvHub-$env:VERSION-win-x64.zip"
           )
           foreach ($file in $expected) {
             if (-not (Test-Path $file)) { throw "缺少产物：$file" }
@@ -88,7 +78,8 @@ jobs:
           $tag = "v$env:VERSION"
           $assets = @(
             "release/EnvHub-$env:VERSION-setup.exe",
-            "release/EnvHub-$env:VERSION-portable.exe"
+            "release/EnvHub-$env:VERSION-portable.exe",
+            "release/EnvHub-$env:VERSION-win-x64.zip"
           )
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {
@@ -96,4 +87,18 @@ jobs:
             gh release edit $tag --notes-file release-notes.md
           } else {
             gh release create $tag $assets --title "EnvHub $env:VERSION" --notes-file release-notes.md
+          }
+
+      # 顺手清掉以前失败的运行记录，避免仓库首页 Actions 一栏长期挂着红叉
+      - name: 清理历史失败记录
+        if: success() && github.ref_type == 'tag'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ids = gh api "repos/${{ github.repository }}/actions/workflows/release.yml/runs?per_page=100" --jq '.workflow_runs[] | select(.conclusion == "failure") | .id'
+          foreach ($id in $ids) {
+            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" | Out-Null
+            "已删除失败运行 $id"
           }
