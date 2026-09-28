@@ -247,6 +247,8 @@ src/
 
 日常校验：`.github/workflows/build.yml` 在推送到 `main` 与 PR 时跑类型检查与编译（`npm ci --ignore-scripts`，不需要 Electron 二进制），README 顶部的 build 徽章即来自它。
 
+两个工作流都用 `run-name` 指定运行标题（否则 GitHub 会拿提交信息当标题，开发用语会直接显示在 Actions 列表里），并在成功后删除自身的历史运行记录，只保留最近一次——想查看历史请用 `git log` 与 Release 页面，需要重跑发布时用 Actions 的 **Re-run jobs**（移动标签会再触发一次完整发布）。
+
 版本号维护：
 
 1. 修改 `package.json` 的 `version`；
