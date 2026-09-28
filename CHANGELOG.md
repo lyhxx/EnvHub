@@ -2,6 +2,57 @@
 
 本文档记录 EnvHub 各版本的实际变更。版本号遵循语义化版本：主版本.次版本.修订号。
 
+## [0.3.0] - 2026-09-28
+
+功能版本：补齐所有环境的官方版本清单，并把应用内安装从这里的两三个环境扩展到"官方提供 ZIP 与校验值即可安装"，同时修掉一批写入、迁移与状态同步的缺陷。
+
+### 新增
+
+- 可用版本列表：13 个环境的「可用版本」页都读取官方发布源——Node.js 取各 LTS 线，Bun 取 GitHub Releases（附 sha256 digest），Eclipse Temurin JDK 取 25 / 21 / 17 / 11，Go 取全部稳定版，Maven 取官方元数据配 archive.apache.org，Gradle 取官方 versions JSON；Python、Rust、.NET、PHP、Ruby、Git、Docker 提供官方直链与发布页。
+- 应用内安装扩展到 Node.js、Bun、JDK、Go、Maven、Gradle：官方 ZIP 解压到 `managedRoot\runtimes\<环境>\<版本>`，装完探测可执行文件与版本并登记；归档内可执行文件的相对路径统一登记在 `relativeExecutables`。
+- 校验值支持多种算法：契约改为 `checksum: { algorithm, value }`，支持 SHA-256 / SHA-512 / SHA-1（Apache Maven 只发布 SHA-512）。
+- 版本号宽松比较：按前导数字段比较并允许一段是另一段的前缀，解决官方发布名与本地实际报出不一致（例如 Temurin 目录名 `21.0.12.1+1` 与 `java -version` 的 `21.0.12.1`）导致的误判与"版本待确认"。
+- 安装标记：安装前写入 `state: "installing"`，完成后改为 `"ready"`。
+- 环境搜索补上工具关键词（`relatedTools`）：`mvn`、`cargo`、`pip` 之类也能命中对应环境。
+
+### 变更
+
+- 版本清单独立成 `src/main/runtime/catalog.ts`（每个环境一个官方源实现）并按 URL 缓存 5 分钟；GitHub 匿名接口的 403 / 429 会提示稍后再试。
+- 支持应用内安装的环境名单统一在 `src/shared/installable.ts`，主进程与界面共用；下载域名白名单统一在 `src/shared/downloadHosts.ts`，校验入口与实际下载（含重定向）共用。
+- 应用内安装的判定收紧为「官方 ZIP + 官方校验值」同时满足，`validateProviderAsset` 二次校验，缺一不开放。
+- 数据目录迁移语义明确：搬移模式会移动文件（跨盘为复制后删除源），仅切换模式保留旧目录内容但不再纳入管理；迁移后同时改写下载任务的文件路径与 PATH 备份里的旧目录，撤销不会再指向已搬走的位置。
+- 不再扫描 `previousManagedRoot`；卸载允许当前与上一个数据目录下的托管版本，前缀比较带分隔符。
+- 数据目录拒绝驱动器根目录与系统目录（Windows / Program Files / ProgramData / Users / System32）。
+- 用户 PATH 中的引号条目按去引号处理：既不漏识别，也不会被「修复 PATH」误删。
+- EnvHub 自身条目的识别改为按 `managedRoot` / `managedPaths` 前缀判定，不再依赖数据目录名含 `envhub`。
+- 扫描期间若环境变量被改动（切换版本、清理遮蔽目录），会用最新 PATH 重新判定"当前使用"，避免旧快照覆盖。
+- 生产环境的 CSP 不再包含开发服务器地址（改由 `.env.development` / `.env.production` 注入），并补 `form-action 'none'`。
+- 类型检查开启 `noUnusedLocals` / `noUnusedParameters`；清理无引用样式（CSS 55 KB → 38 KB）与死代码。
+- 开发依赖补上 `electron-winstaller`（开发宿主所用 rcedit 的来源）；找不到 rcedit 时跳过品牌化而不是直接失败。
+
+### 修复
+
+- JDK 版本源解析失效：Adoptium API v3 的版本信息在 `version.semver`，此前读到空值后回退成主版本号（列表显示为 21），并连带导致装完标"版本待确认"、下载页仍显示"安装"、再点报"该版本已安装"。
+- Maven 的 `settings.xml` 已有 `<mirrors>` 但没有本工具 mirror 时写入静默失效（现在会追加一条），"当前值"改为读取文件里真实的 mirror 地址。
+- `JAVA_HOME` 写入失败被吞掉的问题（现在明确报错）；PATH 备份提前落库，即使后续步骤失败也能撤销。
+- 缺少 `.envhub.json` 标记的安装目录被直接递归删除的问题（现在只清理"安装中"目录与空目录，其余只提示）。
+- 卸载时路径前缀校验可被 `runtimes-other` 之类目录绕过的问题。
+- 数据目录搬移后下载任务的文件路径与 PATH 备份里的旧目录没有跟着改写，导致随后安装失败、撤销写回失效路径的问题。
+- 扫描本机环境与切换版本并发时，旧 PATH 快照覆盖"当前使用"结果的问题。
+- 「自定义代理」按钮直接改本地状态、一有状态广播就被重置的问题。
+- 界面所有报错都带着 `Error invoking remote method 'xxx': Error:` 英文前缀的问题（统一在 preload 剥离）。
+- 手动导入但没有官方校验值时被当成错误显示的问题（改为提示样式）。
+- 操作提示条计数错配导致提前收起或残留的问题。
+- 目标目录被排到最前时被误报为"清理了 1 条旧条目"的问题。
+
+### 已知限制
+
+- 应用内安装覆盖 Node.js、Bun、JDK、Go、Maven、Gradle；其余环境（安装器为 .exe / .msi，或官方未发布校验值）提供官方直链与发布页。
+- Maven、Gradle 的版本号从安装目录名推断，无法识别时标注"待确认"。
+- 修改系统 PATH 需要一次管理员授权，且只做删除遮蔽项。
+- 环境变量的修改对新开的终端生效，已运行的窗口不受影响。
+- 暂未接入代码签名与自动更新。
+
 ## [0.2.0] - 2026-09-27
 
 功能版本：打通"检测 → 下载 → 安装 → 切换默认版本 → 配置软件源"的完整链路，并补齐数据目录迁移、异常恢复与 PATH 处理。

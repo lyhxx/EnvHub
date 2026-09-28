@@ -36,7 +36,7 @@ IPC 层（src/main/ipc.ts）
    ▼
 主进程服务
    ├─ runtime/service.ts    环境检测、版本源、资产解析、"当前使用"解析
-   ├─ services/downloads.ts 下载队列（并发 3、Range 续传、SHA-256）
+   ├─ services/downloads.ts 下载队列（并发 3、Range 续传、按算法校验哈希）
    ├─ services/install.ts   托管安装/卸载（extract-zip）
    ├─ services/environment.ts 用户/系统 PATH、JAVA_HOME、提权接管、特权助手、撤销与修复
    ├─ services/storage.ts   数据目录切换与搬移
@@ -60,7 +60,8 @@ src/
 ├── main/
 │   ├── index.ts              # 入口：单实例、会话锁、窗口、自动扫描、代理初始化
 │   ├── ipc.ts               # 全部 IPC 通道注册
-│   ├── runtime/service.ts   # 检测 + 版本源 + 资产校验 + 当前版本解析
+│   ├── runtime/service.ts   # 检测 + 资产校验 + 当前版本解析
+│   ├── runtime/catalog.ts   # 各环境的官方版本清单（可安装性判定）
 │   ├── services/
 │   │   ├── downloads.ts     # 下载队列与校验
 │   │   ├── install.ts       # 安装 / 卸载
@@ -80,7 +81,10 @@ src/
 │       └── assets/brand/    # 品牌资源
 └── shared/
     ├── contracts.ts         # IPC 契约、数据类型
-    ├── runtimeMeta.ts       # 环境目录元数据
+    ├── runtimeMeta.ts       # 环境目录元数据（含搜索关键词 relatedTools）
+    ├── downloadHosts.ts     # 各环境允许下载的域名（校验与下载共用）
+    ├── installable.ts       # 支持应用内安装的环境名单（主进程与界面共用）
+    ├── versions.ts          # 版本号比较（官方发布名 vs 本地实际报出）
     └── appInfo.ts           # 版本号
 ```
 
@@ -146,10 +150,11 @@ src/
     "maven": { "registry": "https://repo.maven.apache.org/maven2" }
   },
   "managedRoot": "C:\\Users\\<user>\\AppData\\Local\\EnvHub",  // 可迁移
-  "previousManagedRoot": "D:\\envhub",                          // 上次的位置，用于找回记录
+  "previousManagedRoot": "D:\\envhub",                          // 上一次的位置（仅记录，不再参与扫描）
   "installations": [ { "runtimeId": "node", "version": "24.15.0", "source": "path|manual|managed",
                        "executablePath": "…", "managedDir": "…", "isDefault": false, "isCurrent": true } ],
-  "downloads": [ { "id": "…", "status": "…", "receivedBytes": 0, "sha256": "…" } ],
+  "downloads": [ { "id": "…", "status": "…", "receivedBytes": 0,
+                   "checksum": { "algorithm": "sha256|sha512|sha1", "value": "…" } } ],
   "managedPaths": { "node": "C:\\…\\runtimes\\node\\24.21.0" },  // EnvHub 写入 PATH 的目录
   "pathBackups": [ { "at": "…", "previousPath": "…", "appliedPath": "…",
                      "previousMachinePath": "…", "appliedMachinePath": "…" } ]
@@ -158,7 +163,9 @@ src/
 
 下载进度只在状态翻转时落盘，进度本身仅存内存。
 
-托管目录中的每个版本都带一份 `.envhub.json` 标记，用于应用重装或数据目录迁移后重新登记；启动时会清理没有该标记的安装目录（上次中断的残留）。
+托管目录中的每个版本都带一份 `.envhub.json` 标记，用于应用重装或数据目录迁移后重新登记。安装流程会先写入 `state: "installing"` 的标记、完成后再改成 `state: "ready"`；启动扫描时只清理带"安装中"标记的目录与空目录，**没有标记的目录一律保留**（只提示，避免误删用户数据）。旧版本写入的标记没有 `state` 字段，按"已完成"处理。
+
+`previousManagedRoot` 只作为上一次位置的记录，不再参与扫描：选择"仅切换"后旧目录的内容仍留在磁盘上，但不会再被登记进来。
 
 ### 环境变量写入（PATH / JAVA_HOME）约定
 
@@ -179,12 +186,22 @@ src/
    - `commands`：加可执行文件名、版本参数、版本解析正则（不要加会阻塞的交互式命令）。
    - `commonCandidates`：加常见安装目录（PATH 之外的候选位置）。
    - 若只有脚本（`.cmd/.bat`），放入 `scriptCommands`，并且**不要执行它**，改用路径推断版本。
-   - `validateProviderAsset.hosts`：加入允许下载的官方域名。
-   - `getCatalog`：如需应用内下载，新增该环境的版本源分支（必须提供 SHA-256 才允许应用内下载）。
-4. `src/main/services/install.ts`：若支持应用内安装，在 `installableRuntimes` 与 `findExecutable` 中登记可执行文件相对路径。
-5. 界面不需要改动：词云、列表、详情页都由 `runtimeMeta` 驱动。
+   - `relativeExecutables`：登记归档内可执行文件的相对路径（探测与安装共用）。
+   - `src/shared/downloadHosts.ts`：加入该环境的允许下载域名（版本校验与实际下载共用这一份）。
+   - `src/main/runtime/catalog.ts`：新增该环境的版本源实现（约定见下）。
+   - 若支持应用内安装：把 id 加入 `src/shared/installable.ts`。
+4. 界面不需要改动：词云、列表、详情页、"安装"按钮都由上述元数据与共享清单驱动。
 
-> 0.5.0 计划把上述逻辑拆到 `src/main/runtime/providers/<id>.ts`，每个 Provider 声明 detect/catalog/install 能力，进一步降低耦合。
+### 版本源与校验值约定
+
+- 只读官方发布源（官方 API / 官方目录 / 官方 GitHub Releases），不引入第三方镜像。
+- 版本清单按 URL 缓存 5 分钟；GitHub 接口对匿名调用有次数限制，403 / 429 会提示稍后再试。
+- **开放应用内安装的前提是：官方 ZIP 归档 + 官方校验值**。`installSupported` 由 `downloadUrl` 与 `checksum` 同时存在推导，`validateProviderAsset` 会二次校验（并确认该环境在 `installable.ts` 名单内）。
+- 校验算法不统一：Go / Gradle / Bun / Node.js / JDK 是 SHA-256，Apache Maven 是 SHA-512，因此契约里用 `checksum: { algorithm, value }`。
+- 版本号比较统一用 `src/shared/versions.ts` 的 `sameVersion`：官方发布名与本地实际报出经常不一致（例如 Temurin 的 `21.0.12.1+1` 与 `java -version` 的 `21.0.12.1`）。
+- 检查清单：改动某个环境的版本源前，先用真实请求核对字段结构（Adoptium v3 就把版本从 `version_data.semver` 迁到了 `version.semver`）。
+
+> 0.5.0 计划把上述 catalog 实现拆到 `src/main/runtime/providers/<id>.ts`，每个 Provider 声明 detect/catalog/install 能力，进一步降低耦合。
 
 ## 8. 扩展包管理器配置
 
@@ -202,9 +219,10 @@ src/
 - `contextIsolation: true`、`sandbox: true`、`nodeIntegration: false`，preload 只暴露具名方法。
 - IPC 校验发送方为主窗口主框架，且 URL 属于应用自身（开发为 dev server 源，生产为打包后的 `index.html`）。
 - 渲染进程传入的 `runtimeId` 必须在注册表内；`version` 长度受限并在主进程重新解析为资产后才使用。
-- 下载：HTTPS + 域名白名单；重定向逐跳校验；SHA-256 校验失败删除文件。
+- 下载：HTTPS + 域名白名单（`src/shared/downloadHosts.ts`，校验入口与下载逐跳共用）；校验值只取官方发布（`checksum.algorithm` 支持 sha256 / sha512 / sha1），校验失败删除文件；应用内下载仅对「官方 ZIP + 官方校验值」的环境开放。
 - 安装解压：`extract-zip` 防路径穿越；失败回滚。
-- 卸载：目标必须位于 `managedRoot\runtimes` 内且非符号链接。
+- 卸载：目标必须位于当前或上一个数据目录的 `runtimes` 下（前缀比较带路径分隔符）且非符号链接。
+- 版本源：只读官方发布源；清单按 URL 缓存 5 分钟；GitHub 匿名接口的 403 / 429 提示稍后再试；接口字段变更前先用真实请求核对（例如 Adoptium v3 的版本在 `version.semver`）。
 - PATH 写入：默认只写当前用户 PATH（写入前备份、超长中止、可撤销）。注意 Windows 的生效 PATH 是"系统 PATH 在前、用户 PATH 在后"，因此写入用户 PATH 不保证优先级；`services/environment.ts` 会按生效顺序检查是否存在排在更前面的同类可执行文件，并在结果中返回 `shadowedBy`，界面据此提示用户。
 - 系统 PATH 修改：仅在用户确认"移除并生效"后执行，且只删除遮蔽用的目录条目，不新增任何内容；方式为一次性提权或用户显式启用的计划任务助手，原值存入 `pathBackups` 可撤销。系统 PATH 始终以 `ExpandString` 写入，避免 `%SystemRoot%` 这类条目失去展开能力。
 - 特权助手：以 `.ps1` 文件注册到计划任务，每次运行前重写脚本内容，保证不会执行旧版本实现；禁用时会注销该任务。
@@ -239,5 +257,6 @@ src/
 | 安装按钮报"该版本已安装" | 已存在同一版本的托管记录；如需重装先卸载 |
 | 镜像"当前"显示默认位置 | 配置文件里没有对应键，显示的是该工具默认路径；点"应用"后写入 |
 | PATH 改错了 | 设置页 → 本机数据 → 撤销修改（恢复上一次 PATH 与 JAVA_HOME） |
-| 换了数据目录后旧目录还在 | 迁移只复制不删除，确认新目录可用后自行清理旧目录 |
-| 提示"已清理 1 个未完成目录" | 上次安装中断留下的半成品目录（缺少 `.envhub.json` 标记），属正常清理 |
+| 换了数据目录后旧目录还在 | “搬移并切换”会把内容移到新目录（旧目录仅剩空壳）；“仅切换”只改配置，旧目录内容保留但不再纳入管理 |
+| 提示“有 N 个版本目录缺少 EnvHub 标记” | 这些目录不是 EnvHub 装的或标记文件丢失，程序不会自动删除，确认后可手动清理 |
+| 报错里不再有 `Error invoking remote method` | 已在 preload 统一剥离 Electron 的错误前缀，只展示主进程写好的中文提示 |
