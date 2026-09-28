@@ -1,8 +1,8 @@
 name: Release
 
-# 打 v* 标签即自动构建 Windows 安装包并发布到 Releases；
+# 打 v* 标签即自动构建 Windows 安装包（安装版 + 绿色版）并发布到 Releases；
 # 发布说明从 CHANGELOG.md 对应版本的条目生成，无需手工维护。
-# 也可以在 Actions 页面手动触发（仅构建，不发布）。
+# 也可以在 Actions 页面手动触发（仅构建，不发布，用于验证打包）。
 on:
   push:
     tags:
@@ -37,12 +37,34 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      - name: 类型检查与构建
-        run: npm run build
+      # 与本地同一条路径：npm run dist = 类型检查 + 构建 + electron-builder
+      # （scripts/dist.cjs 在 CI 上不设国内镜像，直接用 GitHub）
+      - name: 构建安装版与绿色版
+        env:
+          DEBUG: electron-builder
+        run: npm run dist
 
-      # 不指定 target，按 package.json 配置构建安装版与绿色版（CI 上不设国内镜像，直接用 GitHub）
-      - name: 打安装包与绿色版
-        run: npx electron-builder --win
+      - name: 检查产物
+        shell: pwsh
+        run: |
+          $expected = @(
+            "release/EnvHub-$env:VERSION-setup.exe",
+            "release/EnvHub-$env:VERSION-portable.exe"
+          )
+          foreach ($file in $expected) {
+            if (-not (Test-Path $file)) { throw "缺少产物：$file" }
+            "产物 $(Split-Path $file -Leaf)：$((Get-Item $file).Length) 字节"
+          }
+
+      - name: 失败时上传诊断信息
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            release/builder-debug.yml
+            release/*.log
+          if-no-files-found: ignore
 
       - name: 生成发布说明
         run: node scripts/release-notes.cjs $env:VERSION --out release-notes.md
