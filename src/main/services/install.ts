@@ -1,32 +1,30 @@
 import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import extractZip from 'extract-zip'
-import type { RuntimeId, RuntimeInstallation } from '../../shared/contracts'
-import { probeRuntimeVersion, refreshCurrentFlag } from '../runtime/service'
+import type { RuntimeInstallation } from '../../shared/contracts'
+import { isInstallableRuntime } from '../../shared/installable'
+import { sameVersion } from '../../shared/versions'
+import { probeRuntimeVersion, refreshAllCurrentFlags, refreshCurrentFlag, relativeExecutables } from '../runtime/service'
 import { store } from '../storage/store'
 import { applyDefaultVersion, removeManagedPath } from './environment'
 
-const installableRuntimes: RuntimeId[] = ['node', 'jdk']
-
-export function isInstallableRuntime(runtimeId: RuntimeId): boolean {
-  return installableRuntimes.includes(runtimeId)
+function markerFile(root: string): string {
+  return join(root, '.envhub.json')
 }
 
-async function findExecutable(root: string, runtimeId: RuntimeId): Promise<string | null> {
-  const relative = runtimeId === 'node' ? 'node.exe' : join('bin', 'java.exe')
+// 归档解压后，可执行文件可能在根目录，也可能在一个带版本号的子目录里（Go / Maven / Gradle / JDK 都是后者）。
+async function findByRelative(root: string, relative: string): Promise<string | null> {
   try {
     const direct = join(root, relative)
-    const stat = await lstat(direct)
-    if (stat.isFile()) return direct
+    if ((await lstat(direct)).isFile()) return direct
   } catch { /* try one nested directory below the archive root */ }
   const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
   for (const entry of entries) {
     if (!entry.isDirectory()) continue
     const nested = join(root, entry.name, relative)
     try {
-      const stat = await lstat(nested)
-      if (stat.isFile()) return nested
+      if ((await lstat(nested)).isFile()) return nested
     } catch { /* keep looking */ }
   }
   return null
@@ -46,6 +44,13 @@ export async function installDownloadedRuntime(downloadId: string, activate: boo
 
   await mkdir(dirname(root), { recursive: true })
   await rm(root, { recursive: true, force: true })
+  await mkdir(root, { recursive: true })
+  // 先写"安装中"标记：解压中途崩溃时，下次扫描才知道这个目录是 EnvHub 留下的半成品（而不是用户数据）。
+  await writeFile(markerFile(root), JSON.stringify({
+    runtimeId: task.runtimeId, requestedVersion: task.version, url: task.url, checksum: task.checksum,
+    state: 'installing', startedAt: new Date().toISOString()
+  }, null, 2), 'utf8')
+
   try {
     await extractZip(task.filePath, { dir: root })
   } catch (error) {
@@ -53,29 +58,32 @@ export async function installDownloadedRuntime(downloadId: string, activate: boo
     throw new Error(`解压失败：${error instanceof Error ? error.message : String(error)}`)
   }
 
-  const executablePath = await findExecutable(root, task.runtimeId)
+  const executablePath = await findByRelative(root, relativeExecutables[task.runtimeId])
   if (!executablePath) {
     await rm(root, { recursive: true, force: true }).catch(() => undefined)
     throw new Error('解压完成但没有找到可执行文件，已回滚本次安装')
   }
 
   const detectedVersion = (await probeRuntimeVersion(task.runtimeId, executablePath)) ?? task.version
-  await writeFile(join(root, '.envhub.json'), JSON.stringify({
+  await writeFile(markerFile(root), JSON.stringify({
     runtimeId: task.runtimeId, requestedVersion: task.version, detectedVersion,
-    url: task.url, sha256: task.sha256, installedAt: new Date().toISOString()
+    url: task.url, checksum: task.checksum, state: 'ready', installedAt: new Date().toISOString()
   }, null, 2), 'utf8')
 
   const installation: RuntimeInstallation = {
     id: randomUUID(), runtimeId: task.runtimeId, version: detectedVersion,
-    executablePath, managedDir: root, source: 'managed', verified: detectedVersion === task.version,
+    executablePath, managedDir: root, source: 'managed', verified: sameVersion(detectedVersion, task.version),
     isDefault: false, detectedAt: new Date().toISOString(),
     ...(task.runtimeId === 'jdk' ? { javaKind: 'jdk' as const } : {})
   }
-  await store.setInstallations([...store.snapshot().installations.filter((item) => item.id !== installation.id), installation])
-  await refreshCurrentFlag(task.runtimeId)
+  await store.setInstallations([...store.snapshot().installations, installation])
   if (activate) {
     await applyDefaultVersion(installation)
     await store.activate(installation.id)
+    // 写入 PATH 可能顺带清理了其他运行时的托管目录，必须整体重算。
+    await refreshAllCurrentFlags()
+  } else {
+    await refreshCurrentFlag(task.runtimeId)
   }
   return installation
 }
@@ -84,9 +92,12 @@ export async function uninstallManagedRuntime(id: string): Promise<void> {
   const installation = store.snapshot().installations.find((item) => item.id === id)
   if (!installation) throw new Error('找不到该环境记录')
   if (installation.source !== 'managed' || !installation.managedDir) throw new Error('EnvHub 只能卸载自己托管的版本')
-  const runtimeRoot = resolve(store.snapshot().managedRoot, 'runtimes')
   const target = resolve(installation.managedDir)
-  if (!target.toLowerCase().startsWith(runtimeRoot.toLowerCase())) throw new Error('拒绝删除托管目录之外的路径')
+  // 允许删除当前数据目录与上一个数据目录下的托管版本；前缀必须带分隔符，避免 runtimes-other 之类的旁路。
+  const allowed = [store.snapshot().managedRoot, store.snapshot().previousManagedRoot]
+    .filter((root): root is string => Boolean(root))
+    .some((root) => `${target}${sep}`.toLowerCase().startsWith(`${resolve(root, 'runtimes')}${sep}`.toLowerCase()))
+  if (!allowed) throw new Error('拒绝删除托管目录之外的路径')
   const info = await lstat(target).catch(() => null)
   if (info?.isSymbolicLink()) throw new Error('目标目录是链接，已阻止删除')
   if (info) await rm(target, { recursive: true, force: true })
@@ -95,5 +106,5 @@ export async function uninstallManagedRuntime(id: string): Promise<void> {
   if (managedDirectory && resolve(managedDirectory).toLowerCase() === resolve(dirname(installation.executablePath)).toLowerCase()) {
     await removeManagedPath(installation.runtimeId)
   }
-  await refreshCurrentFlag(installation.runtimeId)
+  await refreshAllCurrentFlags()
 }

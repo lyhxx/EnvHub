@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import type { AppSnapshot, DownloadTask, PackageManagerConfig, PackageManagerId, PathBackup, ProxySettings, RuntimeInstallation, ThemeMode } from '../../shared/contracts'
+import type { AppSnapshot, DownloadTask, FileChecksum, PackageManagerConfig, PackageManagerId, PathBackup, ProxySettings, RuntimeInstallation, ThemeMode } from '../../shared/contracts'
 import { runtimeMeta } from '../../shared/runtimeMeta'
 
 const initial: AppSnapshot = {
@@ -23,6 +23,7 @@ const initial: AppSnapshot = {
 
 const runtimeIds = new Set(runtimeMeta.map((item) => item.id))
 const downloadStatuses = new Set(['queued', 'downloading', 'paused', 'completed', 'failed', 'cancelled'])
+const checksumAlgorithms = new Set(['sha256', 'sha512', 'sha1'])
 
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('数据格式无效')
@@ -83,14 +84,19 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
       const source = item.source === 'manual' ? 'manual' : 'internal'
       const receivedBytes = typeof item.receivedBytes === 'number' && Number.isFinite(item.receivedBytes) ? Math.max(0, item.receivedBytes) : 0
       const totalBytes = typeof item.totalBytes === 'number' && Number.isFinite(item.totalBytes) ? Math.max(0, item.totalBytes) : null
+      const rawChecksum = item.checksum && typeof item.checksum === 'object' ? item.checksum as Record<string, unknown> : null
+      const checksum: FileChecksum | undefined = rawChecksum && checksumAlgorithms.has(String(rawChecksum.algorithm)) && typeof rawChecksum.value === 'string' && /^[a-f0-9]{40,128}$/i.test(rawChecksum.value)
+        ? { algorithm: String(rawChecksum.algorithm) as FileChecksum['algorithm'], value: rawChecksum.value.toLowerCase() }
+        : undefined
       return [{
         id: item.id, runtimeId: item.runtimeId as DownloadTask['runtimeId'], version: item.version.slice(0, 100),
         url: item.url.slice(0, 2048), fileName,
         // Never trust a persisted path; all task I/O is confined to EnvHub's managed download directory.
         filePath: join(managedRoot, 'downloads', `${item.id}-${fileName}`),
         status: item.status as DownloadTask['status'], receivedBytes, totalBytes,
-        speedBytesPerSecond: 0, sha256: typeof item.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(item.sha256) ? item.sha256 : undefined,
+        speedBytesPerSecond: 0, checksum,
         source, error: typeof item.error === 'string' ? item.error.slice(0, 500) : undefined,
+        warning: typeof item.warning === 'string' ? item.warning.slice(0, 300) : undefined,
         createdAt: typeof item.createdAt === 'string' ? item.createdAt.slice(0, 40) : new Date(0).toISOString(),
         updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt.slice(0, 40) : new Date(0).toISOString()
       }]
@@ -219,6 +225,20 @@ export class JsonStore {
 
   async removeInstallation(id: string): Promise<void> {
     this.data.installations = this.data.installations.filter((item) => item.id !== id)
+    await this.persist()
+  }
+
+  // 数据目录迁移后一次性改写任务路径（保留 active/finished 的收纳规则）。
+  async setDownloads(downloads: DownloadTask[]): Promise<void> {
+    const active = downloads.filter((item) => ['queued', 'downloading', 'paused'].includes(item.status))
+    const finished = downloads.filter((item) => !['queued', 'downloading', 'paused'].includes(item.status))
+    this.data.downloads = [...active, ...finished.slice(0, Math.max(0, 30 - active.length))]
+    await this.persist()
+  }
+
+  // 数据目录迁移后改写备份里的路径，避免撤销时把已搬走的旧目录写回 PATH。
+  async setPathBackups(backups: PathBackup[]): Promise<void> {
+    this.data.pathBackups = backups.slice(-10)
     await this.persist()
   }
 

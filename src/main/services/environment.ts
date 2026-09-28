@@ -22,6 +22,14 @@ async function runPowerShell(script: string, timeoutMs = 12_000): Promise<void> 
 const pathCache = new Map<string, { value: string; at: number }>()
 const pathCacheTtl = 5000
 
+// 每次成功写入环境变量都会自增。扫描这类长流程可以用它判断"期间是否被改过"，
+// 避免拿扫描开始时的旧 PATH 覆盖掉刚写入的状态。
+let writeRevision = 0
+
+export function environmentRevision(): number {
+  return writeRevision
+}
+
 function cacheGet(key: string): string | null {
   const hit = pathCache.get(key)
   if (hit && Date.now() - hit.at < pathCacheTtl) return hit.value
@@ -59,7 +67,8 @@ interface EnvironmentSnapshot {
 }
 
 // 一次 PowerShell 调用读齐所有需要的环境变量，避免多次进程启动的开销。
-async function readEnvironmentSnapshot(): Promise<EnvironmentSnapshot> {
+async function readEnvironmentSnapshot(fresh = false): Promise<EnvironmentSnapshot> {
+  if (fresh) pathCache.delete('snapshot')
   const cached = cacheGet('snapshot')
   if (cached !== null) return JSON.parse(cached) as EnvironmentSnapshot
   const expression = `([ordered]@{ userPath = [string][Environment]::GetEnvironmentVariable('Path','User'); machinePath = [string][Environment]::GetEnvironmentVariable('Path','Machine'); javaHome = [string][Environment]::GetEnvironmentVariable('JAVA_HOME','User') } | ConvertTo-Json -Compress)`
@@ -128,11 +137,12 @@ function expandVariables(value: string): string {
 }
 
 // Windows 的生效 PATH = 系统 PATH 在前、用户 PATH 在后（同名变量用户覆盖，但 PATH 是追加）。
-export async function effectivePathEntries(): Promise<string[]> {
-  const [machinePath, userPath] = await Promise.all([readMachinePath(), readUserPath()])
+// fresh=true 会绕过 5 秒缓存重新读取，供长流程（扫描）在写入后复核使用。
+export async function effectivePathEntries(options: { fresh?: boolean } = {}): Promise<string[]> {
+  const snapshot = await readEnvironmentSnapshot(options.fresh === true)
   const seen = new Set<string>()
   const entries: string[] = []
-  for (const raw of [...splitPath(machinePath), ...splitPath(userPath)]) {
+  for (const raw of [...splitPath(snapshot.machinePath), ...splitPath(snapshot.userPath)]) {
     const entry = expandVariables(raw).replace(/[\\/]+$/, '')
     const key = entry.toLocaleLowerCase('en-US')
     if (!entry || seen.has(key)) continue
@@ -142,17 +152,38 @@ export async function effectivePathEntries(): Promise<string[]> {
   return entries
 }
 
+// PATH 里允许出现被引号包起来的条目（部分安装器会这么写），比较与重写前统一去掉引号。
 function splitPath(value: string): string[] {
-  return value.split(';').map((part) => part.trim()).filter(Boolean)
+  return value
+    .split(';')
+    .map((part) => part.trim().replace(/^"(.*)"$/, '$1').trim())
+    .filter(Boolean)
 }
 
 function normalize(value: string): string {
   return value.replace(/[\\/]+$/, '').toLocaleLowerCase('en-US')
 }
 
-// EnvHub 自己写入的条目（含历史遗留的乱码版本：它们仍包含 ASCII 的 EnvHub 路径片段）。
-function isEnvHubEntry(entry: string): boolean {
-  return /[\\/]envhub[\\/](runtimes|privileged|downloads)([\\/]|$)/i.test(expandVariables(entry))
+// EnvHub 自己写入 PATH 的目录（当前数据目录 + 已记录的托管目录）。这些条目在任何 PATH 变化时都该被清掉。
+function envHubPathRoots(): string[] {
+  const snapshot = store.snapshot()
+  const roots = new Set<string>()
+  if (snapshot.managedRoot) roots.add(normalize(snapshot.managedRoot))
+  for (const directory of Object.values(snapshot.managedPaths)) {
+    if (directory) roots.add(normalize(directory))
+  }
+  return [...roots].filter(Boolean)
+}
+
+// 判定某个 PATH 条目是否属于 EnvHub：既认当前数据目录，也认历史遗留的乱码条目
+// （它们仍包含 ASCII 的 EnvHub 路径片段，因此不依赖用户给数据目录起的名字）。
+function isEnvHubEntry(entry: string, roots: string[]): boolean {
+  const value = normalize(expandVariables(entry))
+  if (!value) return false
+  for (const root of roots) {
+    if (value === root || value.startsWith(`${root}\\`) || value.startsWith(`${root}/`)) return true
+  }
+  return /[\\/]envhub[\\/](runtimes|privileged|downloads)([\\/]|$)/i.test(value)
 }
 
 function describeEnvironmentWriteError(error: unknown): Error {
@@ -198,7 +229,7 @@ async function writeUserVariable(name: string, value: string, kind: 'ExpandStrin
     })
     written = true
   } finally {
-    if (written) { cacheApplyWrite(name, value); scheduleEnvironmentBroadcast() }
+    if (written) { writeRevision += 1; cacheApplyWrite(name, value); scheduleEnvironmentBroadcast() }
     else cacheClear()
   }
 }
@@ -255,6 +286,7 @@ export async function applyDefaultVersion(installation: RuntimeInstallation): Pr
   const previousJavaHome = installation.runtimeId === 'jdk' ? await readUserVariable('JAVA_HOME') : undefined
 
   const entries = splitPath(previousPath)
+  const roots = envHubPathRoots()
   const target = normalize(directory)
   const seen = new Set<string>()
   const kept: string[] = []
@@ -263,33 +295,51 @@ export async function applyDefaultVersion(installation: RuntimeInstallation): Pr
     const normalized = normalize(entry)
     // 目标自身的旧条目只是被挪到最前，不算"清理"；EnvHub 托管残留（含历史乱码条目）与重复项才算。
     if (normalized === target) continue
-    if (isEnvHubEntry(entry) || seen.has(normalized)) { cleaned += 1; continue }
+    if (isEnvHubEntry(entry, roots) || seen.has(normalized)) { cleaned += 1; continue }
     seen.add(normalized)
     kept.push(entry)
   }
   const applied = [directory, ...kept].join(';')
   if (applied.length > 30_000) throw new Error('用户 PATH 过长（超过 30000 字符），已中止写入，请先清理 PATH')
-  const changed = applied !== previousPath
-  if (changed) {
+
+  const pathChanged = applied !== previousPath
+  const javaChanged = Boolean(javaHome && javaHome !== previousJavaHome)
+
+  // 先记录备份再写入：即使后续某一步失败，用户仍然可以撤销已经生效的部分。
+  if (pathChanged || javaChanged) {
+    const backup: PathBackup = {
+      at: new Date().toISOString(),
+      previousPath,
+      appliedPath: pathChanged ? applied : previousPath,
+      ...(javaHome ? { previousJavaHome: previousJavaHome || undefined, appliedJavaHome: javaHome } : {})
+    }
+    await store.setManagedPath(installation.runtimeId, directory, backup)
+  }
+
+  if (pathChanged) {
     try {
       await writeUserVariable('Path', applied)
-      if (javaHome && javaHome !== previousJavaHome) await writeUserVariable('JAVA_HOME', javaHome, 'String')
     } catch (error) {
       // 写入超时/报错时回读校验：值可能已经写进去了（广播被拖慢导致超时），避免误报为失败。
       const currentFirst = splitPath(await readUserPath())[0]
       if (normalize(currentFirst ?? '') !== target) throw describeEnvironmentWriteError(error)
     }
-    const backup: PathBackup = {
-      at: new Date().toISOString(), previousPath, appliedPath: applied,
-      ...(javaHome ? { previousJavaHome: previousJavaHome || undefined, appliedJavaHome: javaHome } : {})
+  }
+
+  if (javaChanged && javaHome) {
+    try {
+      await writeUserVariable('JAVA_HOME', javaHome, 'String')
+    } catch (error) {
+      // 不能像 PATH 那样"回读即认为成功"就放过：JAVA_HOME 没写上，Maven / Gradle / IDE 仍会用旧 JDK。
+      const written = (await readUserVariable('JAVA_HOME')) === javaHome
+      if (!written) {
+        throw new Error(`${describeEnvironmentWriteError(error).message}（用户 PATH 已更新，Java 定位的 JDK 未更新；可在设置中撤销）`)
+      }
     }
-    await store.setManagedPath(installation.runtimeId, directory, backup)
-  } else if (javaHome && javaHome !== previousJavaHome) {
-    await writeUserVariable('JAVA_HOME', javaHome, 'String')
   }
 
   const shadowedBy = await findShadowingDirectories(installation, await effectivePathEntries())
-  return { directory, changed, javaHome, ...(cleaned ? { cleaned } : {}), ...(shadowedBy.length ? { shadowedBy } : {}) }
+  return { directory, changed: pathChanged, javaHome, ...(cleaned ? { cleaned } : {}), ...(shadowedBy.length ? { shadowedBy } : {}) }
 }
 
 export interface RepairResult {
@@ -325,18 +375,14 @@ export async function repairUserPath(): Promise<RepairResult> {
 }
 
 export async function removeManagedPath(runtimeId: RuntimeInstallation['runtimeId']): Promise<void> {
-  const snapshot = store.snapshot()
-  const managed = snapshot.managedPaths[runtimeId]
+  const managed = store.snapshot().managedPaths[runtimeId]
   if (!managed) return
   const previousPath = await readUserPath()
   const entries = splitPath(previousPath)
   const kept = entries.filter((entry) => normalize(entry) !== normalize(managed))
   if (kept.length !== entries.length) {
     await writeUserVariable('Path', kept.join(';'))
-    const backup: PathBackup = {
-      at: new Date().toISOString(), previousPath, appliedPath: kept.join(';')
-    }
-    await store.setManagedPath(runtimeId, '', backup)
+    await store.pushPathBackup({ at: new Date().toISOString(), previousPath, appliedPath: kept.join(';') })
   }
   await store.clearManagedPath(runtimeId)
 }
@@ -495,6 +541,7 @@ async function writeMachinePathElevated(value: string): Promise<void> {
     try {
       await runPrivilegedHelper(value)
       // 系统 PATH 变了也要通知一次，新终端才会重新读取。
+      writeRevision += 1
       scheduleEnvironmentBroadcast()
       return
     } catch (error) {
@@ -503,6 +550,7 @@ async function writeMachinePathElevated(value: string): Promise<void> {
     }
   }
   await writeMachinePathElevatedOnce(value)
+  writeRevision += 1
   scheduleEnvironmentBroadcast()
 }
 

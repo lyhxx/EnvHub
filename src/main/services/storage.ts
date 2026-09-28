@@ -57,13 +57,6 @@ async function copyTreeWithProgress(from: string, to: string, label: string): Pr
   emitMoveProgress(100, `${label} 复制完成`)
 }
 
-export interface ManagedRootChangeResult {
-  root: string
-  moved: boolean
-  rewritten: number
-  cleanedPathEntries: number
-}
-
 function normalize(value: string): string {
   return value.replace(/[\\/]+$/, '').toLocaleLowerCase('en-US')
 }
@@ -77,9 +70,27 @@ async function isEmptyDirectory(path: string): Promise<boolean> {
   }
 }
 
+// 拒绝驱动器根目录与系统目录，避免把 runtimes / downloads 建到这些位置。
+const forbiddenRootPatterns = [
+  /^[a-z]:$/i,
+  /^[a-z]:[\\/]windows$/i,
+  /^[a-z]:[\\/]program files$/i,
+  /^[a-z]:[\\/]program files \(x86\)$/i,
+  /^[a-z]:[\\/]programdata$/i,
+  /^[a-z]:[\\/]users$/i,
+  /^[a-z]:[\\/]windows[\\/]system32$/i
+]
+
+function assertUsableRoot(root: string): void {
+  if (!/^[a-zA-Z]:[\\/]/.test(root) || root.includes('..') || root.length > 180) throw new Error('请选择有效的本地目录')
+  if (forbiddenRootPatterns.some((pattern) => pattern.test(root))) {
+    throw new Error('不能使用驱动器根目录或系统目录，请新建一个专用文件夹，例如 D:\\EnvHub')
+  }
+}
+
 export async function changeManagedRoot(nextRoot: string, moveExisting: boolean): Promise<ManagedRootChangeResult> {
   const root = nextRoot.trim().replace(/[\\/]+$/, '')
-  if (!/^[a-zA-Z]:[\\/]/.test(root) || root.includes('..') || root.length > 180) throw new Error('请选择有效的本地目录')
+  assertUsableRoot(root)
   const previousRoot = store.snapshot().managedRoot
   if (normalize(previousRoot) === normalize(root)) throw new Error('新位置与当前位置相同')
 
@@ -130,7 +141,6 @@ export async function changeManagedRoot(nextRoot: string, moveExisting: boolean)
   let rewritten = 0
   let cleanedPathEntries = 0
   if (moved) {
-    // 文件搬到新位置后，把记录里的路径同步改写，否则托管版本会失效。
     const fromPrefix = `${normalize(previousRoot)}\\`
     const rewrite = (value: string): string => join(root, value.slice(previousRoot.length).replace(/^[\\/]+/, ''))
     const installations = store.snapshot().installations.map((item) => {
@@ -148,10 +158,31 @@ export async function changeManagedRoot(nextRoot: string, moveExisting: boolean)
       })
       cleanedPathEntries += 1
     }
+
+    // 下载文件的落盘路径与 PATH 备份里的旧目录同样要跟着搬，否则安装和撤销都会指向已经不存在的路径。
+    const pathPattern = new RegExp(escapeRegExp(previousRoot).replace(/[\\/]/g, '[\\\\/]'), 'gi')
+    const replaceRoot = (value: string): string => value.replace(pathPattern, root)
+    await store.setDownloads(store.snapshot().downloads.map((task) => ({
+      ...task,
+      filePath: join(root, 'downloads', `${task.id}-${task.fileName}`)
+    })))
+    await store.setPathBackups(store.snapshot().pathBackups.map((backup) => ({
+      ...backup,
+      previousPath: replaceRoot(backup.previousPath),
+      appliedPath: replaceRoot(backup.appliedPath),
+      ...(backup.previousJavaHome ? { previousJavaHome: replaceRoot(backup.previousJavaHome) } : {}),
+      ...(backup.appliedJavaHome ? { appliedJavaHome: replaceRoot(backup.appliedJavaHome) } : {}),
+      ...(backup.previousMachinePath ? { previousMachinePath: replaceRoot(backup.previousMachinePath) } : {}),
+      ...(backup.appliedMachinePath ? { appliedMachinePath: replaceRoot(backup.appliedMachinePath) } : {})
+    })))
   }
 
   await mkdir(join(root, 'downloads'), { recursive: true })
   return { root, moved, rewritten, cleanedPathEntries }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 async function readUserPathSafe(): Promise<string> {

@@ -1,6 +1,6 @@
 {
   "name": "envhub",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "productName": "EnvHub",
   "description": "A local development environment manager for Windows",
   "main": "out/main/index.js",
@@ -23,6 +23,7 @@
     "electron": "^44.4.5",
     "electron-builder": "^26.0.12",
     "electron-vite": "^5.0.0",
+    "electron-winstaller": "^5.4.0",
     "typescript": "^5.9.3",
     "vite": "^7.2.2",
     "vue-tsc": "^3.1.1"

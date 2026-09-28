@@ -1,5 +1,6 @@
 const { spawn, spawnSync } = require('node:child_process')
 const fs = require('node:fs/promises')
+const fsSync = require('node:fs')
 const path = require('node:path')
 
 const root = path.resolve(__dirname, '..')
@@ -9,10 +10,20 @@ const cacheDir = path.join(root, 'node_modules', '.cache', 'envhub-dev-electron'
 const devExecutable = path.join(cacheDir, 'EnvHub.exe')
 const markerPath = path.join(cacheDir, '.envhub-dev-host')
 const iconPath = path.join(root, 'build', 'icon.ico')
-const rceditPath = path.join(root, 'node_modules', 'electron-winstaller', 'vendor', 'rcedit.exe')
 const cliPath = path.join(root, 'node_modules', 'electron-vite', 'bin', 'electron-vite.js')
 const packageVersion = require(path.join(root, 'package.json')).version
 const fileVersion = `${packageVersion}.0`
+
+// rcedit 用来把开发宿主副本改名换图标。它由 electron-winstaller 附带（已声明为 devDependency），
+// 但版本升级可能改变路径，所以这里逐个候选查找；实在找不到就跳过品牌化，不影响开发。
+function findRcedit() {
+  const candidates = [
+    path.join(root, 'node_modules', 'electron-winstaller', 'vendor', 'rcedit.exe'),
+    path.join(root, 'node_modules', 'rcedit', 'bin', 'rcedit.exe'),
+    path.join(root, 'node_modules', 'rcedit', 'bin', 'rcedit-x64.exe')
+  ]
+  return candidates.find((candidate) => fsSync.existsSync(candidate)) ?? null
+}
 
 async function linkTree(source, target) {
   await fs.mkdir(target, { recursive: true })
@@ -53,7 +64,13 @@ async function prepareBrandedElectron() {
   await linkTree(electronDist, cacheDir)
 
   if (!(await fs.stat(devExecutable)).isFile()) throw new Error('无法准备 EnvHub.exe 开发宿主')
-  if (!(await fs.stat(rceditPath)).isFile()) throw new Error('缺少 rcedit.exe；请重新执行 npm install')
+
+  const rceditPath = findRcedit()
+  if (!rceditPath) {
+    console.warn('未找到 rcedit.exe，跳过开发宿主品牌信息（任务栏可能显示 Electron）。重新执行 npm install 可修复。')
+    await fs.writeFile(markerPath, stamp, 'utf8')
+    return
+  }
 
   const args = [
     devExecutable,

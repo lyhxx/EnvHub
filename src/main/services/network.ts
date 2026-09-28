@@ -19,13 +19,13 @@ export async function applyProxy(settings: ProxySettings): Promise<ProxyStatus> 
   }
   await store.setProxy(settings)
   try { return await getProxyStatus() }
-  catch { return { settings, resolution: '代理设置已应用，但暂时无法读取路由状态', checkedUrl: testUrl } }
+  catch { return { settings, resolution: '代理设置已应用，但暂时无法读取路由状态' } }
 }
 
 export async function getProxyStatus(): Promise<ProxyStatus> {
   const settings = store.snapshot().proxy
   const resolution = await session.defaultSession.resolveProxy(testUrl)
-  return { settings, resolution: resolution.trim() || '未能解析代理状态', checkedUrl: testUrl }
+  return { settings, resolution: resolution.trim() || '未能解析代理状态' }
 }
 
 export async function testProxyConnection(): Promise<ProxyStatus> {

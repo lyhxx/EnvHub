@@ -5,7 +5,8 @@ import { copyFile, lstat, mkdir, stat, unlink } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import type { DownloadTask, RuntimeCatalogItem } from '../../shared/contracts'
+import type { ChecksumAlgorithm, DownloadTask, RuntimeCatalogItem } from '../../shared/contracts'
+import { isAllowedDownloadHost } from '../../shared/downloadHosts'
 import { store } from '../storage/store'
 import { validateProviderAsset } from '../runtime/service'
 
@@ -42,16 +43,11 @@ function safeName(fileName: string): string {
 }
 
 function allowedFinalHost(item: RuntimeCatalogItem, url: string): boolean {
-  const host = new URL(url).hostname.toLowerCase()
-  const allowed: Record<string, string[]> = {
-    node: ['nodejs.org'],
-    jdk: ['api.adoptium.net', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']
-  }
-  return (allowed[item.runtimeId] ?? []).includes(host)
+  return isAllowedDownloadHost(item.runtimeId, url)
 }
 
-async function sha256(path: string): Promise<string> {
-  const hash = createHash('sha256')
+async function hashFile(path: string, algorithm: ChecksumAlgorithm): Promise<string> {
+  const hash = createHash(algorithm)
   const { createReadStream } = await import('node:fs')
   for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer)
   return hash.digest('hex')
@@ -68,9 +64,9 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 
-  if (offset > 0 && task.totalBytes !== null && offset === task.totalBytes && item.sha256) {
-    const actual = await sha256(task.filePath)
-    if (actual.toLowerCase() === item.sha256.toLowerCase()) {
+  if (offset > 0 && task.totalBytes !== null && offset === task.totalBytes && item.checksum) {
+    const actual = await hashFile(task.filePath, item.checksum.algorithm)
+    if (actual.toLowerCase() === item.checksum.value) {
       task.receivedBytes = offset
       update(task, { status: 'completed', receivedBytes: offset, totalBytes: offset, speedBytesPerSecond: 0 }, true)
       return
@@ -126,11 +122,11 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
   })
   await pipeline(source, meter, createWriteStream(task.filePath, { flags: append ? 'a' : 'w' }), { signal: controller.signal })
 
-  if (item.sha256) {
-    const actual = await sha256(task.filePath)
-    if (actual.toLowerCase() !== item.sha256.toLowerCase()) {
+  if (item.checksum) {
+    const actual = await hashFile(task.filePath, item.checksum.algorithm)
+    if (actual.toLowerCase() !== item.checksum.value) {
       await unlink(task.filePath).catch(() => undefined)
-      throw new Error('SHA-256 校验失败，文件已删除')
+      throw new Error(`${item.checksum.algorithm.toUpperCase()} 校验失败，文件已删除`)
     }
   }
   update(task, { status: 'completed', receivedBytes: task.receivedBytes, totalBytes: task.totalBytes ?? task.receivedBytes, speedBytesPerSecond: 0 }, true)
@@ -153,7 +149,7 @@ async function run(task: DownloadTask): Promise<void> {
   const item: RuntimeCatalogItem = {
     runtimeId: task.runtimeId, version: task.version,
     architecture: process.arch === 'arm64' ? 'arm64' : 'x64',
-    downloadUrl: task.url, sha256: task.sha256, fileName: task.fileName,
+    downloadUrl: task.url, checksum: task.checksum, fileName: task.fileName,
     pageUrl: '', installSupported: true
   }
   const controller = new AbortController()
@@ -181,7 +177,7 @@ export async function startDownload(item: RuntimeCatalogItem): Promise<DownloadT
     id, runtimeId: item.runtimeId, version: item.version, url: item.downloadUrl!, fileName,
     filePath: join(store.snapshot().managedRoot, 'downloads', `${id}-${fileName}`),
     status: 'queued', receivedBytes: 0, totalBytes: null, speedBytesPerSecond: 0,
-    sha256: item.sha256, source: 'internal', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    checksum: item.checksum, source: 'internal', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
   }
   await store.upsertDownload(task)
   pending.add(id)
@@ -232,16 +228,16 @@ export async function importDownloadedFile(item: RuntimeCatalogItem): Promise<Do
   const filePath = join(folder, `${id}-${fileName}`)
   await copyFile(sourcePath, filePath, constants.COPYFILE_EXCL)
   const stagedInfo = await stat(filePath)
-  const actualHash = await sha256(filePath)
-  if (item.sha256 && actualHash.toLowerCase() !== item.sha256.toLowerCase()) {
+  const actualHash = await hashFile(filePath, 'sha256')
+  if (item.checksum && (await hashFile(filePath, item.checksum.algorithm)).toLowerCase() !== item.checksum.value) {
     await unlink(filePath).catch(() => undefined)
-    throw new Error('SHA-256 与官方发布值不匹配；导入副本已删除')
+    throw new Error(`${item.checksum.algorithm.toUpperCase()} 与官方发布值不匹配；导入副本已删除`)
   }
   const task: DownloadTask = {
     id, runtimeId: item.runtimeId, version: item.version, url: item.downloadUrl ?? item.pageUrl,
     fileName, filePath, status: 'completed', receivedBytes: stagedInfo.size, totalBytes: stagedInfo.size,
-    speedBytesPerSecond: 0, sha256: actualHash, source: 'manual',
-    error: item.sha256 ? undefined : '本地 SHA-256 已生成，但没有官方校验值；来源未验证。',
+    speedBytesPerSecond: 0, checksum: item.checksum ?? { algorithm: 'sha256', value: actualHash }, source: 'manual',
+    warning: item.checksum ? undefined : '没有官方校验值，只记录了本地 SHA-256；来源未经验证。',
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
   }
   await store.upsertDownload(task)

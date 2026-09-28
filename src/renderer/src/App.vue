@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { Directive } from 'vue'
 import type { AppSnapshot, DownloadTask, ProxyStatus, RuntimeCatalogItem, RuntimeId, RuntimeInstallation, ThemeMode } from '../../shared/contracts'
 import { runtimeMeta, runtimeGroups } from '../../shared/runtimeMeta'
+import { isInstallableRuntime } from '../../shared/installable'
+import { sameVersion } from '../../shared/versions'
 import { APP_STAGE, APP_VERSION } from '../../shared/appInfo'
 import brandMark from './assets/brand/envhub-mark.png'
 
@@ -32,6 +34,9 @@ const scanning = ref(false)
 const busy = ref(false)
 const testingProxy = ref(false)
 const manualProxyServer = ref('')
+// “自定义代理”只是先把输入框露出来，不要直接改本地快照——任何状态广播都会把它冲掉。
+const proxyModeDraft = ref<'manual' | null>(null)
+const shownProxyMode = computed(() => proxyModeDraft.value ?? snapshot.value?.proxy.mode ?? 'system')
 const notice = ref('')
 const tooltip = ref<{ text: string; x: number; y: number; below: boolean } | null>(null)
 const operation = ref<{ title: string; detail?: string; percent?: number } | null>(null)
@@ -254,7 +259,7 @@ async function changeStorageRoot(): Promise<void> {
       lines: [
         `新位置：${picked}`,
         '选择“搬移并切换”会把现有的运行时、下载文件和特权助手目录一起移动过去；跨磁盘时会复制文件，过程会显示进度。',
-        '选择“仅切换”则保留旧目录中的文件不动，但失效的托管版本记录会被清理。'
+        '选择“仅切换”则保留旧目录中的文件不动；旧目录里的托管版本仍会留在清单中，可逐个卸载。'
       ],
       confirmText: '搬移并切换', cancelText: '仅切换'
     })
@@ -361,7 +366,17 @@ function onOperationProgress(payload: { percent: number; detail: string }): void
 }
 
 async function withOperation<T>(title: string, detail: string | undefined, task: () => Promise<T>, delayMs = 320): Promise<T> {
-  const timer = setTimeout(() => beginOperation(title, detail), delayMs)
+  // operationDepth 只有在真正 beginOperation 之后才成对释放，否则会把别的操作的提示条提前收掉。
+  let began = false
+  let finished = false
+  const finish = (): void => {
+    if (finished) return
+    finished = true
+    clearTimeout(timer)
+    clearInterval(watchdog)
+    if (began) { began = false; endOperation() }
+  }
+  const timer = setTimeout(() => { began = true; beginOperation(title, detail) }, delayMs)
   let start = 0
   const watchdog = setInterval(() => {
     if (!operation.value) { clearInterval(watchdog); return }
@@ -369,16 +384,14 @@ async function withOperation<T>(title: string, detail: string | undefined, task:
     // 底层调用异常缓慢时不要一直转圈：超过 60 秒就收起操作条并说明情况。
     if (Date.now() - start > 60_000) {
       clearInterval(watchdog)
-      endOperation()
+      if (began) { began = false; endOperation() }
       say('操作耗时超出预期，已停止等待；结果可能稍后自动生效', 4000)
     }
   }, 2000)
   try {
     return await task()
   } finally {
-    clearTimeout(timer)
-    clearInterval(watchdog)
-    endOperation()
+    finish()
   }
 }
 
@@ -552,7 +565,9 @@ async function openDownloadLink(item: RuntimeCatalogItem): Promise<void> {
 
 async function openOfficial(runtimeId: RuntimeId): Promise<void> {
   const url = runtimeMeta.find((item) => item.id === runtimeId)?.officialUrl
-  if (url) await window.envhub.app.openExternal(url)
+  if (!url) return
+  try { await window.envhub.app.openExternal(url) }
+  catch (error) { say(error instanceof Error ? error.message : '无法打开官方网站') }
 }
 
 async function handleManualFile(item: RuntimeCatalogItem): Promise<void> {
@@ -574,7 +589,7 @@ async function copyTaskLink(task: DownloadTask): Promise<void> {
 }
 
 function isInstalled(task: DownloadTask): boolean {
-  return installations.value.some((item) => item.source === 'managed' && item.runtimeId === task.runtimeId && item.version === task.version)
+  return installations.value.some((item) => item.source === 'managed' && item.runtimeId === task.runtimeId && sameVersion(item.version, task.version))
 }
 
 async function loadProxy(): Promise<void> {
@@ -598,6 +613,7 @@ async function saveProxy(mode: 'system' | 'direct' | 'manual'): Promise<void> {
   try {
     proxyStatus.value = await window.envhub.network.setProxy({ mode, server: mode === 'manual' ? manualProxyServer.value.trim() : '' })
     snapshot.value = await window.envhub.app.getSnapshot()
+    proxyModeDraft.value = null
     say('代理设置已应用；下载和版本查询将使用此连接')
   } catch (error) { say(error instanceof Error ? error.message : '代理设置失败') }
   finally { busy.value = false }
@@ -798,13 +814,13 @@ onUnmounted(() => {
                   <div v-if="catalogLoading" class="catalog-loading surface-card"><span class="loader"></span> 正在从官方源读取版本与校验信息…</div>
                   <div v-else-if="catalog.length" class="catalog-list">
                     <article v-for="item in catalog" :key="`${item.version}-${item.architecture}`" class="catalog-card surface-card">
-                      <div class="catalog-version"><span class="release-mark"></span><div><b>{{ item.version }}</b><small>{{ item.architecture === 'x64' ? 'Windows x64' : item.architecture === 'arm64' ? 'Windows ARM64' : 'Windows' }} <span v-if="item.sha256">· SHA-256 可验证</span></small></div></div>
+                      <div class="catalog-version"><span class="release-mark"></span><div><b>{{ item.version }}</b><small>{{ item.architecture === 'x64' ? 'Windows x64' : item.architecture === 'arm64' ? 'Windows ARM64' : 'Windows' }} <span v-if="item.checksum">· {{ item.checksum.algorithm.toUpperCase() }} 可验证</span></small></div></div>
                       <p>{{ item.note }}</p>
-                      <div class="catalog-actions"><button class="button button-outline small-button" @click="copyLink(item)">复制{{ item.downloadUrl ? '直链' : '官网链接' }}</button><button v-if="item.downloadUrl" class="button button-outline small-button" @click="openDownloadLink(item)">浏览器下载 ↗</button><button v-if="item.downloadUrl && item.sha256" class="button button-outline small-button" @click="handleManualFile(item)">导入并校验</button><button v-if="item.installSupported" class="button button-dark small-button" @click="startDownload(item)">应用内下载 <span>↓</span></button><button v-else class="button button-dark small-button" @click="openOfficial(selectedRuntime)">打开官方网站 <span>↗</span></button></div>
+                      <div class="catalog-actions"><button class="button button-outline small-button" @click="copyLink(item)">复制{{ item.downloadUrl ? '直链' : '官网链接' }}</button><button v-if="item.downloadUrl" class="button button-outline small-button" @click="openDownloadLink(item)">浏览器下载 ↗</button><button v-if="item.downloadUrl && item.checksum" class="button button-outline small-button" @click="handleManualFile(item)">导入并校验</button><button v-if="item.installSupported" class="button button-dark small-button" @click="startDownload(item)">应用内下载 <span>↓</span></button><button v-else class="button button-dark small-button" @click="openOfficial(selectedRuntime)">打开官方网站 <span>↗</span></button></div>
                     </article>
                   </div>
                   <div v-else class="catalog-placeholder surface-card"><span class="catalog-orbit">↗</span><div><b>尚未读取版本列表</b><small>使用右上方的“获取版本列表”读取官方发布信息。</small></div></div>
-                  <div class="managed-warning"><span>i</span><p>下载归档不等于安装。安装流程只有在来源、校验和安装步骤经过验证后才会开放；不会自动运行来源不明的安装包。</p></div>
+                  <div class="managed-warning"><span>i</span><p>下载归档不等于安装：只有来自官方源、且带校验值的归档才会开放应用内安装，安装过程也不会执行安装包里的脚本。</p></div>
                 </section>
               </div>
             </div>
@@ -817,8 +833,8 @@ onUnmounted(() => {
           <div class="download-list surface-card" v-if="downloads.length">
             <article v-for="task in downloads" :key="task.id" class="download-row">
               <div class="download-file-icon" :class="statusClass(task.status)">{{ task.status === 'completed' ? '✓' : task.status === 'failed' ? '!' : '↓' }}</div>
-              <div class="download-content"><div class="download-title-row"><div class="download-title">{{ runtimeMeta.find(item => item.id === task.runtimeId)?.name }} <span>{{ task.version }}</span></div><span :class="['task-status', statusClass(task.status)]">{{ statusLabel(task.status) }}</span></div><div class="download-progress-line"><div class="progress-track large-progress"><i :class="{ indeterminate: !task.totalBytes && task.status === 'downloading' }" :style="{ width: `${task.totalBytes ? progress(task) : 30}%` }"></i></div><span>{{ formatBytes(task.receivedBytes) }}<template v-if="task.totalBytes"> / {{ formatBytes(task.totalBytes) }}</template></span></div><div v-if="task.error" class="download-error">{{ task.error }}</div><div class="download-meta"><span class="mono copyable" v-tip="`${task.filePath}\n点击复制`" @click="copyPath(task.filePath)">{{ task.source === 'manual' ? '浏览器下载 · 已校验' : task.status === 'downloading' ? `${formatBytes(task.speedBytesPerSecond)}/s` : task.fileName }}</span><span v-if="task.status === 'downloading' && task.totalBytes">{{ progress(task) }}%</span><span v-else class="mono">{{ new Date(task.createdAt).toLocaleDateString('zh-CN') }}</span></div></div>
-              <div class="download-actions"><button v-if="task.status === 'downloading' || task.status === 'queued'" class="small-action" @click="pauseTask(task.id)">暂停</button><button v-else-if="['paused', 'failed', 'cancelled'].includes(task.status)" class="small-action" @click="resumeTask(task.id)">{{ task.status === 'failed' ? '重试 / 续传' : '继续下载' }}</button><button v-if="task.status === 'completed' && ['node', 'jdk'].includes(task.runtimeId) && !isInstalled(task)" class="button button-dark small-button" :disabled="Boolean(installingTaskId)" @click="installTask(task)">{{ installingTaskId === task.id ? '安装中…' : '安装' }}</button><span v-else-if="task.status === 'completed' && isInstalled(task)" class="installed-hint">已安装</span><button v-if="!['completed', 'cancelled'].includes(task.status)" class="more-action" v-tip data-tip="取消并保留已下载部分" @click="cancelTask(task.id)">×</button><button class="more-action" v-tip data-tip="复制来源链接" @click="copyTaskLink(task)">↗</button><button class="more-action" v-tip data-tip="删除任务" @click="removeTask(task)">✕</button></div>
+              <div class="download-content"><div class="download-title-row"><div class="download-title">{{ runtimeMeta.find(item => item.id === task.runtimeId)?.name }} <span>{{ task.version }}</span></div><span :class="['task-status', statusClass(task.status)]">{{ statusLabel(task.status) }}</span></div><div class="download-progress-line"><div class="progress-track large-progress"><i :class="{ indeterminate: !task.totalBytes && task.status === 'downloading' }" :style="{ width: `${task.totalBytes ? progress(task) : 30}%` }"></i></div><span>{{ formatBytes(task.receivedBytes) }}<template v-if="task.totalBytes"> / {{ formatBytes(task.totalBytes) }}</template></span></div><div v-if="task.error" class="download-error">{{ task.error }}</div><div v-else-if="task.warning" class="download-warning">{{ task.warning }}</div><div class="download-meta"><span class="mono copyable" v-tip="`${task.filePath}\n点击复制`" @click="copyPath(task.filePath)">{{ task.source === 'manual' ? (task.warning ? '浏览器下载 · 仅本地校验' : '浏览器下载 · 已校验') : task.status === 'downloading' ? `${formatBytes(task.speedBytesPerSecond)}/s` : task.fileName }}</span><span v-if="task.status === 'downloading' && task.totalBytes">{{ progress(task) }}%</span><span v-else class="mono">{{ new Date(task.createdAt).toLocaleDateString('zh-CN') }}</span></div></div>
+              <div class="download-actions"><button v-if="task.status === 'downloading' || task.status === 'queued'" class="small-action" @click="pauseTask(task.id)">暂停</button><button v-else-if="['paused', 'failed', 'cancelled'].includes(task.status)" class="small-action" @click="resumeTask(task.id)">{{ task.status === 'failed' ? '重试 / 续传' : '继续下载' }}</button><button v-if="task.status === 'completed' && isInstallableRuntime(task.runtimeId) && !isInstalled(task)" class="button button-dark small-button" :disabled="Boolean(installingTaskId)" @click="installTask(task)">{{ installingTaskId === task.id ? '安装中…' : '安装' }}</button><span v-else-if="task.status === 'completed' && isInstalled(task)" class="installed-hint">已安装</span><button v-if="!['completed', 'cancelled'].includes(task.status)" class="more-action" v-tip data-tip="取消并保留已下载部分" @click="cancelTask(task.id)">×</button><button class="more-action" v-tip data-tip="复制来源链接" @click="copyTaskLink(task)">↗</button><button class="more-action" v-tip data-tip="删除任务" @click="removeTask(task)">✕</button></div>
             </article>
           </div>
           <div v-else class="empty-download surface-card"><div class="download-empty-orbit"><span>↓</span><i></i></div><h2>下载列表是空的</h2><p>在环境与工具库选择版本开始下载，或复制官方直链后用浏览器下载。</p><button class="button button-dark" @click="page = 'runtimes'">浏览可用版本 <span>→</span></button></div>
@@ -834,8 +850,8 @@ onUnmounted(() => {
                 <div class="proxy-modes"><button v-if="!helperEnabled" class="proxy-mode wide" @click="enableHelper"><span><b>启用一次性授权</b><small>创建仅用于修改系统 PATH 的计划任务，之后切换不再弹 UAC</small></span></button><button v-else class="proxy-mode wide" @click="disableHelper"><span><b>撤销授权</b><small>删除计划任务，恢复为每次操作请求管理员确认</small></span></button></div>
               </section>
               <section class="settings-card surface-card"><div class="settings-card-heading"><div class="settings-icon proxy-icon">↯</div><div><h3>网络与代理</h3><p>版本查询与应用内下载使用 Chromium 网络栈，支持系统代理和 PAC。</p></div><span class="settings-live"><i></i>已接入</span></div>
-                <div class="proxy-modes"><button :class="['proxy-mode', { chosen: snapshot?.proxy.mode === 'system' }]" @click="saveProxy('system')"><span><b>使用系统代理</b><small>自动读取 Windows 代理 / PAC 配置</small></span></button><button :class="['proxy-mode', { chosen: snapshot?.proxy.mode === 'direct' }]" @click="saveProxy('direct')"><span><b>直接连接</b><small>不经过代理服务器</small></span></button><button :class="['proxy-mode', { chosen: snapshot?.proxy.mode === 'manual' }]" @click="snapshot && (snapshot.proxy.mode = 'manual')"><span><b>自定义代理</b><small>HTTP(S) 或 SOCKS 代理地址</small></span></button></div>
-                <div v-if="snapshot?.proxy.mode === 'manual'" class="manual-proxy"><label for="proxy-server">代理服务器地址</label><div class="input-action"><input id="proxy-server" v-model="manualProxyServer" placeholder="http://127.0.0.1:7890" /><button class="button button-dark small-button" :disabled="busy" @click="saveProxy('manual')">应用</button></div><small>例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。暂不保存代理账号密码。</small></div>
+                <div class="proxy-modes"><button :class="['proxy-mode', { chosen: shownProxyMode === 'system' }]" @click="saveProxy('system')"><span><b>使用系统代理</b><small>自动读取 Windows 代理 / PAC 配置</small></span></button><button :class="['proxy-mode', { chosen: shownProxyMode === 'direct' }]" @click="saveProxy('direct')"><span><b>直接连接</b><small>不经过代理服务器</small></span></button><button :class="['proxy-mode', { chosen: shownProxyMode === 'manual' }]" @click="proxyModeDraft = 'manual'"><span><b>自定义代理</b><small>HTTP(S) 或 SOCKS 代理地址</small></span></button></div>
+                <div v-if="shownProxyMode === 'manual'" class="manual-proxy"><label for="proxy-server">代理服务器地址</label><div class="input-action"><input id="proxy-server" v-model="manualProxyServer" placeholder="http://127.0.0.1:7890" /><button class="button button-dark small-button" :disabled="busy" @click="saveProxy('manual')">应用</button></div><small>例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。暂不保存代理账号密码。</small></div>
                 <div class="proxy-diagnostic"><span :class="['diagnostic-pulse', { 'pulse-error': proxyStatus?.reachable === false, 'pulse-good': proxyStatus?.reachable }]" ></span><div><b>连接路由</b><small>{{ proxyStatus?.resolution ?? '正在读取代理解析结果…' }}<template v-if="proxyStatus?.reachable"> · {{ proxyStatus.latencyMs }} ms</template><template v-else-if="proxyStatus?.reachable === false"> · {{ proxyStatus.testError }}</template></small></div><button class="quiet-link" :disabled="testingProxy" @click="testProxy">{{ testingProxy ? '检测中…' : '连接测试 ↻' }}</button></div>
               </section>
               <section class="settings-card surface-card"><div class="settings-card-heading"><div class="settings-icon">⌂</div><div><h3>本机数据</h3><p>运行时、下载文件和清单都存在本机；可以换到其他磁盘。</p></div></div><div class="data-path"><span>数据目录</span><span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(snapshot?.managedRoot ?? '')">{{ snapshot?.managedRoot }}</span><button class="quiet-link" @click="changeStorageRoot">更改 →</button></div><div class="data-path"><span>下载目录</span><span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(downloadDirectory)">{{ downloadDirectory }}</span><button class="quiet-link" @click="openDownloadDirectory">打开 →</button></div><div v-if="snapshot?.pathBackups?.length" class="data-path"><span>PATH 备份</span><span class="data-desc">最近一次修改 · <span class="mono">{{ new Date(snapshot.pathBackups[snapshot.pathBackups.length - 1].at).toLocaleString('zh-CN') }}</span></span><button class="quiet-link" @click="undoLastPathChange">撤销修改 →</button></div><div class="data-path"><span>环境变量</span><span class="data-desc">清理用户 PATH 中的重复项与失效目录</span><button class="quiet-link" @click="repairPath">修复 PATH →</button></div><div class="settings-foot">不创建账户或上传扫描清单。在线查询时仅请求官方公开版本目录。</div></section>

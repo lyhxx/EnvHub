@@ -80,7 +80,6 @@ function updatePipIni(content: string, registry: string): string {
 }
 
 function updateMavenSettings(content: string, registry: string): string {
-  const existingMirror = /<mirror>[\s\S]*?<\/mirror>/i
   const mirrorBlock = [
     '    <mirror>',
     '      <id>envhub-central</id>',
@@ -90,13 +89,14 @@ function updateMavenSettings(content: string, registry: string): string {
   ].join('\n')
 
   if (/<mirrors>[\s\S]*?<\/mirrors>/i.test(content)) {
-    const withMirror = content.replace(/<mirrors>[\s\S]*?<\/mirrors>/i, (block) => {
-      if (/<id>\s*envhub-central\s*<\/id>/i.test(block)) {
-        return block.replace(/<mirror>[\s\S]*?<\/mirror>/i, (mirror) => (/<id>\s*envhub-central\s*<\/id>/i.test(mirror) ? mirrorBlock : mirror))
+    return content.replace(/<mirrors>([\s\S]*?)<\/mirrors>/i, (block, inner: string) => {
+      if (/<id>\s*envhub-central\s*<\/id>/i.test(inner)) {
+        // 已有本工具的 mirror：只替换它，保持用户其它镜像原样。
+        return block.replace(/<mirror>[\s\S]*?<\/mirror>/gi, (mirror) => (/<id>\s*envhub-central\s*<\/id>/i.test(mirror) ? mirrorBlock : mirror))
       }
+      // 有 <mirrors> 但没有本工具的 mirror：追加一个新的，不能什么都不做。
       return block.replace(/<\/mirrors>/i, `${mirrorBlock}\n  </mirrors>`)
     })
-    return withMirror
   }
 
   if (!content.trim()) {
@@ -197,7 +197,13 @@ async function writeConfigFile(manager: PackageManagerId, content: string, encod
 
 function parseRegistry(manager: PackageManagerId, content: string): string | null {
   if (manager === 'npm') return content.match(/^\s*registry\s*=\s*(.*?)\s*$/im)?.[1] ?? null
-  if (manager === 'maven') return content.match(/<id>\s*envhub-central\s*<\/id>\s*<url>\s*([^<]+?)\s*<\/url>/i)?.[1] ?? null
+  if (manager === 'maven') {
+    // 优先读本工具写入的 mirror；没有的话退回文件里第一个 mirror 的地址，避免显示与文件不一致。
+    const own = content.match(/<id>\s*envhub-central\s*<\/id>\s*<url>\s*([^<]+?)\s*<\/url>/i)?.[1]
+    if (own) return own
+    const firstMirror = content.match(/<mirror>[\s\S]*?<\/mirror>/i)?.[0]
+    return firstMirror?.match(/<url>\s*([^<]+?)\s*<\/url>/i)?.[1] ?? null
+  }
   const globalSection = content.match(/^\s*\[global\]\s*$([\s\S]*?)(?=^\s*\[[^\]]+\]\s*$|\s*$)/im)?.[1]
   return globalSection?.match(/^\s*index-url\s*=\s*(.*?)\s*$/im)?.[1] ?? null
 }

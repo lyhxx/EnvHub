@@ -4,6 +4,14 @@ export type ThemeMode = 'light' | 'dark' | 'system'
 export type ProxyMode = 'system' | 'direct' | 'manual'
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed' | 'cancelled'
 
+// 官方发布方提供的校验值算法各不相同（Go / Gradle 给 SHA-256，Apache 给 SHA-512）。
+export type ChecksumAlgorithm = 'sha256' | 'sha512' | 'sha1'
+
+export interface FileChecksum {
+  algorithm: ChecksumAlgorithm
+  value: string
+}
+
 export interface RuntimeMeta {
   id: RuntimeId
   name: string
@@ -52,8 +60,7 @@ export interface RuntimeCatalogItem {
   version: string
   architecture: 'x64' | 'arm64' | 'universal'
   downloadUrl?: string
-  checksumUrl?: string
-  sha256?: string
+  checksum?: FileChecksum
   fileName?: string
   pageUrl: string
   installSupported: boolean
@@ -71,9 +78,10 @@ export interface DownloadTask {
   receivedBytes: number
   totalBytes: number | null
   speedBytesPerSecond: number
-  sha256?: string
+  checksum?: FileChecksum
   source?: 'internal' | 'manual'
   error?: string
+  warning?: string
   createdAt: string
   updatedAt: string
 }
@@ -86,7 +94,6 @@ export interface ProxySettings {
 export interface ProxyStatus {
   settings: ProxySettings
   resolution: string
-  checkedUrl: string
   reachable?: boolean
   latencyMs?: number
   testError?: string
