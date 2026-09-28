@@ -7,12 +7,17 @@ import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ChecksumAlgorithm, DownloadTask, RuntimeCatalogItem } from '../../shared/contracts'
 import { isAllowedDownloadHost } from '../../shared/downloadHosts'
+import { APP_VERSION } from '../../shared/appInfo'
 import { store } from '../storage/store'
 import { validateProviderAsset } from '../runtime/service'
 
 const active = new Map<string, AbortController>()
 const pending = new Set<string>()
+// 长时间收不到数据的任务：中止后要判失败，而不是像用户暂停那样静默退出。
+const stalled = new Set<string>()
 const concurrency = 3
+const stallTimeout = 60_000
+const userAgent = `EnvHub/${APP_VERSION}`
 
 async function ensureDownloadsDirectory(): Promise<string> {
   const root = store.snapshot().managedRoot
@@ -75,7 +80,7 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
     offset = 0
   }
 
-  const headers: Record<string, string> = { 'User-Agent': 'EnvHub/0.1' }
+  const headers: Record<string, string> = { 'User-Agent': userAgent }
   if (offset > 0) headers.Range = `bytes=${offset}-`
   let requestUrl = item.downloadUrl!
   let response: Response | undefined
@@ -106,10 +111,20 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
 
   let lastEmit = Date.now()
   let lastBytes = offset
+  let lastActivity = Date.now()
+  // 连接卡住时不要永远停在"下载中"：超过 60 秒没有任何数据就中止并判失败，已下载部分保留，方便重试续传。
+  const stallTimer = setInterval(() => {
+    if (Date.now() - lastActivity > stallTimeout) {
+      clearInterval(stallTimer)
+      stalled.add(task.id)
+      controller.abort()
+    }
+  }, 5_000)
   const source = Readable.fromWeb(response.body as never)
   const meter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       task.receivedBytes += chunk.length
+      lastActivity = Date.now()
       const now = Date.now()
       if (now - lastEmit >= 350) {
         const speed = (task.receivedBytes - lastBytes) / ((now - lastEmit) / 1000)
@@ -120,7 +135,11 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
       callback(null, chunk)
     }
   })
-  await pipeline(source, meter, createWriteStream(task.filePath, { flags: append ? 'a' : 'w' }), { signal: controller.signal })
+  try {
+    await pipeline(source, meter, createWriteStream(task.filePath, { flags: append ? 'a' : 'w' }), { signal: controller.signal })
+  } finally {
+    clearInterval(stallTimer)
+  }
 
   if (item.checksum) {
     const actual = await hashFile(task.filePath, item.checksum.algorithm)
@@ -157,11 +176,19 @@ async function run(task: DownloadTask): Promise<void> {
   try {
     await transfer(task, item, controller)
   } catch (error) {
-    if (controller.signal.aborted) return
+    if (controller.signal.aborted) {
+      // 用户暂停/取消：保持原状态；超时中止：判为失败，保留已下载部分以便续传。
+      if (stalled.has(task.id)) {
+        stalled.delete(task.id)
+        update(task, { status: 'failed', error: '长时间没有收到数据，已停止下载；可点「重试 / 续传」继续', speedBytesPerSecond: 0 }, true)
+      }
+      return
+    }
     const current = store.snapshot().downloads.find((entry) => entry.id === task.id)
     if (current?.status === 'paused' || current?.status === 'cancelled') return
     update(task, { status: 'failed', error: error instanceof Error ? error.message : String(error), speedBytesPerSecond: 0 }, true)
   } finally {
+    stalled.delete(task.id)
     active.delete(task.id)
     pump()
   }
@@ -228,10 +255,12 @@ export async function importDownloadedFile(item: RuntimeCatalogItem): Promise<Do
   const filePath = join(folder, `${id}-${fileName}`)
   await copyFile(sourcePath, filePath, constants.COPYFILE_EXCL)
   const stagedInfo = await stat(filePath)
-  const actualHash = await hashFile(filePath, 'sha256')
-  if (item.checksum && (await hashFile(filePath, item.checksum.algorithm)).toLowerCase() !== item.checksum.value) {
+  // 只算一次哈希：有官方校验值就按官方算法，否则记为本地 SHA-256。
+  const algorithm: ChecksumAlgorithm = item.checksum?.algorithm ?? 'sha256'
+  const actualHash = await hashFile(filePath, algorithm)
+  if (item.checksum && actualHash !== item.checksum.value) {
     await unlink(filePath).catch(() => undefined)
-    throw new Error(`${item.checksum.algorithm.toUpperCase()} 与官方发布值不匹配；导入副本已删除`)
+    throw new Error(`${algorithm.toUpperCase()} 与官方发布值不匹配；导入副本已删除`)
   }
   const task: DownloadTask = {
     id, runtimeId: item.runtimeId, version: item.version, url: item.downloadUrl ?? item.pageUrl,

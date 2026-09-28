@@ -120,7 +120,7 @@ export interface EnvHubApi {
     openExternal(url: string): Promise<void>
     copyText(text: string): Promise<void>
     chooseManagedRoot(): Promise<string | null>
-    setManagedRoot(path: string, moveExisting: boolean): Promise<{ root: string; moved: boolean; rewritten: number; cleanedPathEntries: number }>
+    setManagedRoot(path: string, moveExisting: boolean): Promise<{ root: string; moved: boolean; rewritten: number; cleanedPathEntries: number; clearedDownloads: number }>
   }
   runtime: {
     scan(): Promise<RuntimeInstallation[]>

@@ -259,7 +259,7 @@ async function changeStorageRoot(): Promise<void> {
       lines: [
         `新位置：${picked}`,
         '选择“搬移并切换”会把现有的运行时、下载文件和特权助手目录一起移动过去；跨磁盘时会复制文件，过程会显示进度。',
-        '选择“仅切换”则保留旧目录中的文件不动；旧目录里的托管版本仍会留在清单中，可逐个卸载。'
+        '选择“仅切换”则保留旧目录中的文件不动；旧目录里的托管版本仍会留在清单中，可逐个卸载（旧目录下的下载记录会被清理）。'
       ],
       confirmText: '搬移并切换', cancelText: '仅切换'
     })
@@ -271,6 +271,7 @@ async function changeStorageRoot(): Promise<void> {
       const extras: string[] = []
       if (result.rewritten) extras.push(`同步 ${result.rewritten} 条记录路径`)
       if (result.cleanedPathEntries) extras.push(`同步 ${result.cleanedPathEntries} 条 PATH 条目`)
+      if (result.clearedDownloads) extras.push(`清理 ${result.clearedDownloads} 条旧目录下的下载记录（文件仍在旧目录）`)
       say(`数据目录已切换到 ${result.root}${extras.length ? `；${extras.join('，')}` : ''}`)
     } catch (error) { say(error instanceof Error ? error.message : '切换数据目录失败') }
     finally { endOperation() }

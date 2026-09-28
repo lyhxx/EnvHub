@@ -8,6 +8,7 @@ import type { RuntimeCatalogItem, RuntimeId, RuntimeInstallation } from '../../s
 import { runtimeMeta } from '../../shared/runtimeMeta'
 import { isAllowedDownloadHost } from '../../shared/downloadHosts'
 import { isInstallableRuntime } from '../../shared/installable'
+import { relativeExecutables, runtimeExecutables } from '../../shared/executables'
 import { loadCatalog } from './catalog'
 import { store } from '../storage/store'
 import { effectivePathEntries, environmentRevision } from '../services/environment'
@@ -34,21 +35,9 @@ const commands: Record<RuntimeId, { exe: string; args: string[]; pattern: RegExp
 
 const scriptCommands: Partial<Record<RuntimeId, string>> = { maven: 'mvn.cmd', gradle: 'gradle.bat' }
 
-// 每个环境在"某个候选根目录 / 子目录"下的可执行文件相对路径。探测候选与托管安装都复用它。
-export const relativeExecutables: Record<RuntimeId, string> = {
-  python: 'python.exe',
-  node: 'node.exe',
-  bun: 'bun.exe',
-  jdk: join('bin', 'java.exe'),
-  git: 'git.exe',
-  go: join('bin', 'go.exe'),
-  rust: 'rustc.exe',
-  dotnet: 'dotnet.exe',
-  php: 'php.exe',
-  ruby: join('bin', 'ruby.exe'),
-  maven: join('bin', 'mvn.cmd'),
-  gradle: join('bin', 'gradle.bat'),
-  docker: 'docker.exe'
+// 寻找候选可执行文件时，需要同时考虑脚本类工具（mvn.cmd / gradle.bat）。
+function executableNames(runtimeId: RuntimeId): string[] {
+  return [...runtimeExecutables[runtimeId], ...(scriptCommands[runtimeId] ? [scriptCommands[runtimeId]!] : [])]
 }
 
 function normalizePath(value: string): string {
@@ -88,7 +77,7 @@ async function javaKind(executablePath: string): Promise<'jdk' | 'jre'> {
 }
 
 async function findCandidatesOnPath(runtimeId: RuntimeId, entries: string[]): Promise<string[]> {
-  const names = [...commands[runtimeId].map((command) => command.exe), ...(scriptCommands[runtimeId] ? [scriptCommands[runtimeId]!] : [])]
+  const names = executableNames(runtimeId)
   const found: string[] = []
   for (const entry of entries) {
     for (const name of names) {
@@ -151,7 +140,7 @@ async function commonCandidates(runtimeId: RuntimeId): Promise<string[]> {
 }
 
 async function findManagedExecutable(root: string, runtimeId: RuntimeId): Promise<string | null> {
-  const names = [...commands[runtimeId].map((command) => command.exe), ...(scriptCommands[runtimeId] ? [scriptCommands[runtimeId]!] : [])]
+  const names = executableNames(runtimeId)
   const tryPaths = async (base: string): Promise<string | null> => {
     for (const name of names) {
       const candidate = join(base, name)
@@ -292,7 +281,7 @@ export async function scanRuntime(): Promise<RuntimeInstallation[]> {
 }
 
 async function resolveCurrentExecutable(runtimeId: RuntimeId, entries: string[]): Promise<string | null> {
-  const names = [...commands[runtimeId].map((command) => command.exe), ...(scriptCommands[runtimeId] ? [scriptCommands[runtimeId]!] : [])]
+  const names = executableNames(runtimeId)
   if (!names.length) return null
   for (const entry of entries) {
     for (const name of names) {
@@ -318,7 +307,7 @@ export async function refreshCurrentFlag(runtimeId: RuntimeId): Promise<void> {
 }
 
 export async function adoptDetectedDirectories(runtimeId: RuntimeId, directories: string[]): Promise<number> {
-  const names = [...commands[runtimeId].map((command) => command.exe), ...(scriptCommands[runtimeId] ? [scriptCommands[runtimeId]!] : [])]
+  const names = executableNames(runtimeId)
   if (!names.length) return 0
   const installations = [...store.snapshot().installations]
   let added = 0
@@ -379,7 +368,7 @@ export async function registerManual(runtimeId: RuntimeId): Promise<RuntimeInsta
   if (result.canceled || !result.filePaths[0]) return null
   const executablePath = result.filePaths[0]
   const selectedName = executablePath.split(/[\\/]/).pop()?.toLowerCase()
-  const accepted = commands[runtimeId].some((item) => item.exe.toLowerCase() === selectedName) || scriptCommands[runtimeId]?.toLowerCase() === selectedName
+  const accepted = executableNames(runtimeId).some((name) => name.toLowerCase() === selectedName)
   if (!accepted) throw new Error(`选择的文件不是受支持的 ${meta.name} 可执行文件`)
   const version = await runVersion(executablePath, runtimeId)
   if (!version) throw new Error(`无法从该文件读取 ${meta.name} 版本`)

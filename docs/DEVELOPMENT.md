@@ -82,6 +82,7 @@ src/
 └── shared/
     ├── contracts.ts         # IPC 契约、数据类型
     ├── runtimeMeta.ts       # 环境目录元数据（含搜索关键词 relatedTools）
+    ├── executables.ts       # 各环境的可执行文件名与归档内相对路径
     ├── downloadHosts.ts     # 各环境允许下载的域名（校验与下载共用）
     ├── installable.ts       # 支持应用内安装的环境名单（主进程与界面共用）
     ├── versions.ts          # 版本号比较（官方发布名 vs 本地实际报出）
@@ -186,20 +187,23 @@ src/
    - `commands`：加可执行文件名、版本参数、版本解析正则（不要加会阻塞的交互式命令）。
    - `commonCandidates`：加常见安装目录（PATH 之外的候选位置）。
    - 若只有脚本（`.cmd/.bat`），放入 `scriptCommands`，并且**不要执行它**，改用路径推断版本。
-   - `relativeExecutables`：登记归档内可执行文件的相对路径（探测与安装共用）。
-   - `src/shared/downloadHosts.ts`：加入该环境的允许下载域名（版本校验与实际下载共用这一份）。
-   - `src/main/runtime/catalog.ts`：新增该环境的版本源实现（约定见下）。
-   - 若支持应用内安装：把 id 加入 `src/shared/installable.ts`。
-4. 界面不需要改动：词云、列表、详情页、"安装"按钮都由上述元数据与共享清单驱动。
+4. 共享清单（新增环境时逐项登记，避免多处漂移）：
+   - `src/shared/executables.ts`：`runtimeExecutables`（可执行文件名，用于探测与遮蔽检测）与 `relativeExecutables`（归档内相对路径，用于托管安装）。
+   - `src/shared/downloadHosts.ts`：该环境允许下载的域名（版本校验与实际下载共用）。
+   - `src/shared/installable.ts`：若支持应用内安装，把 id 加进名单。
+5. `src/main/runtime/catalog.ts`：新增该环境的版本源实现（约定见下）。
+6. 界面不需要改动：词云、列表、详情页、"安装"按钮都由上述元数据与共享清单驱动。
 
 ### 版本源与校验值约定
 
 - 只读官方发布源（官方 API / 官方目录 / 官方 GitHub Releases），不引入第三方镜像。
 - 版本清单按 URL 缓存 5 分钟；GitHub 接口对匿名调用有次数限制，403 / 429 会提示稍后再试。
+- 每个请求 15 秒超时（`requestTimeout`）；**全部来源失败时抛错**，不要返回空列表（界面会显示成"官方没有版本"）；单个来源失败保留其余结果，并且不要丢掉直链。用 `ensureNotEmpty()` 统一这个约定。
 - **开放应用内安装的前提是：官方 ZIP 归档 + 官方校验值**。`installSupported` 由 `downloadUrl` 与 `checksum` 同时存在推导，`validateProviderAsset` 会二次校验（并确认该环境在 `installable.ts` 名单内）。
 - 校验算法不统一：Go / Gradle / Bun / Node.js / JDK 是 SHA-256，Apache Maven 是 SHA-512，因此契约里用 `checksum: { algorithm, value }`。
+- 发行包来源优先选**永久保留且快**的官方源：Maven 用 Maven Central（`repo.maven.apache.org`，同时提供 `.sha512`），失败回退 `archive.apache.org/dist`；PHP 的下载基址取官方重定向后的地址，不要写死。
 - 版本号比较统一用 `src/shared/versions.ts` 的 `sameVersion`：官方发布名与本地实际报出经常不一致（例如 Temurin 的 `21.0.12.1+1` 与 `java -version` 的 `21.0.12.1`）。
-- 检查清单：改动某个环境的版本源前，先用真实请求核对字段结构（Adoptium v3 就把版本从 `version_data.semver` 迁到了 `version.semver`）。
+- 检查清单：改动某个环境的版本源前，先用真实请求核对字段结构（Adoptium v3 就把版本从 `version_data.semver` 迁到了 `version.semver`）；改完用真实数据跑一遍（含一次完整下载与校验）。
 
 > 0.5.0 计划把上述 catalog 实现拆到 `src/main/runtime/providers/<id>.ts`，每个 Provider 声明 detect/catalog/install 能力，进一步降低耦合。
 
@@ -259,4 +263,6 @@ src/
 | PATH 改错了 | 设置页 → 本机数据 → 撤销修改（恢复上一次 PATH 与 JAVA_HOME） |
 | 换了数据目录后旧目录还在 | “搬移并切换”会把内容移到新目录（旧目录仅剩空壳）；“仅切换”只改配置，旧目录内容保留但不再纳入管理 |
 | 提示“有 N 个版本目录缺少 EnvHub 标记” | 这些目录不是 EnvHub 装的或标记文件丢失，程序不会自动删除，确认后可手动清理 |
+| “仅切换”数据目录后下载列表变空 | 下载文件仍留在旧目录，记录已无法使用（重启后路径会按新目录重算），因此切换时会清理并提示 |
+| 下载卡在“下载中”不动 | 超过 60 秒没有任何数据会判为失败并保留已下载部分，点“重试 / 续传”继续 |
 | 报错里不再有 `Error invoking remote method` | 已在 preload 统一剥离 Electron 的错误前缀，只展示主进程写好的中文提示 |

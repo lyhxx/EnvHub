@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { PathBackup, RuntimeInstallation } from '../../shared/contracts'
+import { runtimeExecutables } from '../../shared/executables'
 import { store } from '../storage/store'
 
 const exec = promisify(execFile)
@@ -242,24 +243,9 @@ export interface ActivationResult {
   cleaned?: number
 }
 
-const runtimeExecutableNames: Partial<Record<RuntimeInstallation['runtimeId'], string[]>> = {
-  node: ['node.exe'],
-  bun: ['bun.exe'],
-  python: ['python.exe'],
-  jdk: ['java.exe'],
-  git: ['git.exe'],
-  go: ['go.exe'],
-  rust: ['rustc.exe'],
-  dotnet: ['dotnet.exe'],
-  php: ['php.exe'],
-  ruby: ['ruby.exe'],
-  maven: ['mvn.cmd'],
-  gradle: ['gradle.bat'],
-  docker: ['docker.exe']
-}
-
 async function findShadowingDirectories(installation: RuntimeInstallation, effective: string[]): Promise<string[]> {
-  const names = runtimeExecutableNames[installation.runtimeId] ?? []
+  // python 的 python3.exe 也算同名工具，检测遮蔽时一并考虑。
+  const names = [...runtimeExecutables[installation.runtimeId], ...(installation.runtimeId === 'python' ? ['python3.exe'] : [])]
   if (!names.length) return []
   const { access } = await import('node:fs/promises')
   const target = normalize(dirname(installation.executablePath))

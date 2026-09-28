@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { PackageManagerConfig, PackageManagerId } from '../../shared/contracts'
+import { APP_VERSION } from '../../shared/appInfo'
 import { store } from '../storage/store'
 
 const configFiles: Record<PackageManagerId, string> = {
@@ -269,7 +270,7 @@ export async function testPackageRegistry(manager: PackageManagerId, value: stri
   const timeout = setTimeout(() => controller.abort(), 12_000)
   const startedAt = Date.now()
   try {
-    const response = await net.fetch(registry, { headers: { Range: 'bytes=0-0', 'User-Agent': 'EnvHub/0.1' }, signal: controller.signal })
+    const response = await net.fetch(registry, { headers: { Range: 'bytes=0-0', 'User-Agent': `EnvHub/${APP_VERSION}` }, signal: controller.signal })
     if (!response.ok && response.status !== 206) throw new Error(`HTTP ${response.status}`)
     await response.body?.cancel()
     return { ok: true, latencyMs: Date.now() - startedAt }

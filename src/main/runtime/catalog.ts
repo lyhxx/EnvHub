@@ -2,40 +2,64 @@ import { net } from 'electron'
 import type { ChecksumAlgorithm, FileChecksum, RuntimeCatalogItem, RuntimeId } from '../../shared/contracts'
 import { runtimeMeta } from '../../shared/runtimeMeta'
 import { isInstallableRuntime } from '../../shared/installable'
+import { displayVersion } from '../../shared/versions'
+import { APP_VERSION } from '../../shared/appInfo'
 
 // 各环境的官方版本清单都在这里取。原则：
 // 1) 只读官方发布源，不用第三方镜像；
 // 2) 只有「官方 ZIP 归档 + 官方校验值」才开放应用内安装，其余只提供版本列表与官方链接；
-// 3) 结果按 URL 缓存，避免反复请求（GitHub 接口对匿名调用有次数限制）。
+// 3) 结果按 URL 缓存，避免反复请求（GitHub 接口对匿名调用有次数限制）；
+// 4) 每个请求都有超时，单个来源失败不会让界面一直转圈，也不会静默变成空列表。
 
 type Architecture = 'x64' | 'arm64'
 
-interface CacheEntry { at: number; value: string }
+interface CacheEntry { at: number; value: string; finalUrl: string }
 const cache = new Map<string, CacheEntry>()
 const cacheTtl = 5 * 60 * 1000
+const requestTimeout = 15_000
 
-function cached(key: string): string | null {
+function cached(key: string): CacheEntry | null {
   const hit = cache.get(key)
-  if (hit && Date.now() - hit.at < cacheTtl) return hit.value
+  if (hit && Date.now() - hit.at < cacheTtl) return hit
   return null
 }
 
-async function fetchText(url: string, allowedHosts: string | string[]): Promise<string> {
+async function fetchTextWithUrl(url: string, allowedHosts: string | string[]): Promise<{ text: string; finalUrl: string }> {
   const allowed = Array.isArray(allowedHosts) ? allowedHosts : [allowedHosts]
   const key = `text:${url}`
   const hit = cached(key)
-  if (hit !== null) return hit
-  const response = await net.fetch(url, { headers: { 'User-Agent': 'EnvHub/0.2' } })
-  if (response.url && !allowed.includes(new URL(response.url).hostname.toLowerCase())) throw new Error('版本源重定向到了非预期域名')
-  if (response.status === 403 || response.status === 429) throw new Error('官方版本源暂时限制了访问频率，请稍后再试')
-  if (!response.ok) throw new Error(`版本源请求失败：HTTP ${response.status}`)
-  const text = await response.text()
-  cache.set(key, { at: Date.now(), value: text })
-  return text
+  if (hit) return { text: hit.value, finalUrl: hit.finalUrl }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), requestTimeout)
+  try {
+    const response = await net.fetch(url, { headers: { 'User-Agent': `EnvHub/${APP_VERSION}` }, signal: controller.signal })
+    const finalUrl = response.url || url
+    if (!allowed.includes(new URL(finalUrl).hostname.toLowerCase())) throw new Error('版本源重定向到了非预期域名')
+    if (response.status === 403 || response.status === 429) throw new Error('官方版本源暂时限制了访问频率，请稍后再试')
+    if (!response.ok) throw new Error(`版本源请求失败：HTTP ${response.status}`)
+    const text = await response.text()
+    cache.set(key, { at: Date.now(), value: text, finalUrl })
+    return { text, finalUrl }
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('官方版本源响应超时，请检查网络或代理后重试')
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function fetchText(url: string, allowedHosts: string | string[]): Promise<string> {
+  return (await fetchTextWithUrl(url, allowedHosts)).text
 }
 
 async function fetchJson<T>(url: string, allowedHosts: string | string[]): Promise<T> {
   return JSON.parse(await fetchText(url, allowedHosts)) as T
+}
+
+// 全部来源都失败时不要把空列表交给界面（那样看起来像"官方没有版本"）。
+function ensureNotEmpty(items: RuntimeCatalogItem[], label: string): RuntimeCatalogItem[] {
+  if (!items.length) throw new Error(`暂时无法从官方源读取${label}版本，请检查网络或代理后重试`)
+  return items
 }
 
 function pageUrlOf(runtimeId: RuntimeId): string {
@@ -82,6 +106,7 @@ async function nodeCatalog(architecture: Architecture): Promise<RuntimeCatalogIt
     if (!latestPerMajor.has(major)) latestPerMajor.set(major, release.version.replace(/^v/, ''))
   }
   const versions = [...latestPerMajor.values()].slice(0, 3)
+  if (!versions.length) throw new Error('官方源没有返回 Node.js LTS 版本，请稍后再试')
   return Promise.all(versions.map(async (version) => {
     const fileName = `node-v${version}-win-${architecture}.zip`
     const base = `https://nodejs.org/dist/v${version}`
@@ -93,7 +118,11 @@ async function nodeCatalog(architecture: Architecture): Promise<RuntimeCatalogIt
         note: checksum ? '官方 LTS ZIP；下载后会校验 SHA-256，可直接在应用内安装。' : '官方校验值未找到，暂不允许应用内下载。'
       })
     } catch {
-      return item('node', version, architecture, { pageUrl: `${base}/`, note: '暂时读不到该版本的校验清单，请稍后重试。' })
+      // 校验清单读不到时仍然给出直链，至少可以复制链接用浏览器下载。
+      return item('node', version, architecture, {
+        downloadUrl: `${base}/${fileName}`, fileName,
+        note: '暂时读不到该版本的校验清单，可复制直链用浏览器下载；应用内安装暂不可用。'
+      })
     }
   }))
 }
@@ -114,7 +143,7 @@ async function jdkCatalog(architecture: Architecture): Promise<RuntimeCatalogIte
       if (!pkg?.link || !pkg.checksum) return null
       // Adoptium v3 的版本在 version.semver（形如 21.0.12+101.0.LTS），去掉构建元数据后与 java -version 一致。
       const raw = release.version?.semver ?? release.release_name?.replace(/^jdk-/, '') ?? String(major)
-      const version = raw.split('+')[0] ?? String(major)
+      const version = displayVersion(raw) || String(major)
       const fileName = pkg.name ?? new URL(pkg.link).pathname.split('/').pop() ?? `jdk-${major}.zip`
       return item('jdk', version, architecture, {
         downloadUrl: pkg.link, fileName, checksum: checksumOf('sha256', pkg.checksum),
@@ -124,7 +153,7 @@ async function jdkCatalog(architecture: Architecture): Promise<RuntimeCatalogIte
       return null
     }
   }))
-  return assets.filter((entry): entry is RuntimeCatalogItem => entry !== null)
+  return ensureNotEmpty(assets.filter((entry): entry is RuntimeCatalogItem => entry !== null), 'Temurin JDK')
 }
 
 // ── Python：官方 FTP 目录（安装包是 .exe，只做版本列表与浏览器下载） ──────────────
@@ -138,12 +167,12 @@ async function pythonCatalog(architecture: Architecture): Promise<RuntimeCatalog
     })
     .sort(compareVersionsDesc)
     .slice(0, 10)
-  return versions.map((version) => item('python', version, architecture, {
+  return ensureNotEmpty(versions.map((version) => item('python', version, architecture, {
     downloadUrl: `https://www.python.org/ftp/python/${version}/python-${version}-amd64.exe`,
     fileName: `python-${version}-amd64.exe`,
     pageUrl: `https://www.python.org/downloads/release/python-${version.replace(/\./g, '')}/`,
     note: '官方 Windows 安装包（.exe）：可在浏览器下载后运行安装；安装完成后 EnvHub 会自动识别。'
-  }))
+  })), 'Python')
 }
 
 // ── Go：官方 JSON 带 SHA-256，ZIP 可直接应用内安装 ────────────────────────────────
@@ -152,7 +181,7 @@ async function goCatalog(architecture: Architecture): Promise<RuntimeCatalogItem
     'https://go.dev/dl/?mode=json&include=all', 'go.dev'
   )
   const wanted = architecture === 'arm64' ? 'arm64' : 'amd64'
-  return releases
+  return ensureNotEmpty(releases
     .filter((release) => release.stable)
     .slice(0, 8)
     .map((release) => {
@@ -164,7 +193,7 @@ async function goCatalog(architecture: Architecture): Promise<RuntimeCatalogItem
         checksum,
         note: checksum ? '官方 Windows ZIP；下载后会校验 SHA-256，可直接在应用内安装。' : '官方校验值未找到，暂不允许应用内下载。'
       })
-    })
+    }), 'Go')
 }
 
 // ── Bun：GitHub Releases（附带 sha256 digest），ZIP 可应用内安装 ───────────────────
@@ -194,14 +223,14 @@ async function bunCatalog(architecture: Architecture): Promise<RuntimeCatalogIte
       note: checksum ? '官方 Windows ZIP；下载后会校验 SHA-256，可直接在应用内安装。' : '官方未提供校验值，请用浏览器下载后手动登记。'
     }))
   }
-  return items
+  return ensureNotEmpty(items, 'Bun')
 }
 
 // ── Rust：版本列表 + 官方 MSI 链接（安装建议走 rustup） ────────────────────────────
 async function rustCatalog(architecture: Architecture): Promise<RuntimeCatalogItem[]> {
   const releases = await githubReleases('rust-lang/rust', 8)
   const target = architecture === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc'
-  return releases
+  return ensureNotEmpty(releases
     .filter((release) => /^v?\d+\.\d+\.\d+$/.test(release.tag_name))
     .map((release) => {
       const version = release.tag_name.replace(/^v/, '')
@@ -210,7 +239,7 @@ async function rustCatalog(architecture: Architecture): Promise<RuntimeCatalogIt
         fileName: `rust-${version}-${target}.msi`,
         note: '官方 MSI 安装包；推荐用 rustup 安装与切换版本，EnvHub 提供版本识别与官网入口。'
       })
-    })
+    }), 'Rust')
 }
 
 // ── .NET：官方 SDK ZIP（官方只发布 hash，算法未标注，暂不应用内安装） ──────────────
@@ -237,31 +266,33 @@ async function dotnetCatalog(architecture: Architecture): Promise<RuntimeCatalog
       return null
     }
   }))
-  return items.filter((entry): entry is RuntimeCatalogItem => entry !== null).slice(0, 4)
+  return ensureNotEmpty(items.filter((entry): entry is RuntimeCatalogItem => entry !== null).slice(0, 4), '.NET SDK')
 }
 
 // ── PHP：官方 NTS ZIP（官方无校验文件，只做列表与浏览器下载） ─────────────────────
 async function phpCatalog(architecture: Architecture): Promise<RuntimeCatalogItem[]> {
-  // windows.php.net 的下载目录会重定向到 downloads.php.net，两个域名都要放行。
-  const listing = await fetchText('https://windows.php.net/downloads/releases/', ['windows.php.net', 'downloads.php.net'])
-  const base = 'https://downloads.php.net/~windows/releases/'
+  // windows.php.net 的下载目录会重定向到 downloads.php.net，用重定向后的地址作为下载基址，避免路径写死。
+  const listing = await fetchTextWithUrl('https://windows.php.net/downloads/releases/', ['windows.php.net', 'downloads.php.net'])
+  const base = listing.finalUrl.endsWith('/') ? listing.finalUrl : `${listing.finalUrl}/`
   const best = new Map<string, string>()
-  for (const match of listing.matchAll(/href="(php-(\d+\.\d+)\.(\d+)-nts-Win32-vs\d+-x64\.zip)"/g)) {
+  for (const match of listing.text.matchAll(/href="(php-(\d+\.\d+)\.(\d+)-nts-Win32-vs\d+-x64\.zip)"/g)) {
     const minor = match[2]
     const file = match[1]
     const current = best.get(minor)
     if (!current || compareVersionsDesc(current.replace(/^php-/, ''), file.replace(/^php-/, '')) > 0) best.set(minor, file)
   }
-  return [...best.values()]
+  // PHP 官方只发布 x64 构建，ARM64 上也列出 x64 包（可正常在 Windows ARM64 上运行）。
+  const armNote = architecture === 'arm64' ? '（官方未提供 ARM64 构建，此处为 x64 包）' : ''
+  return ensureNotEmpty([...best.values()]
     .sort(compareVersionsDesc)
     .slice(0, 5)
     .map((file) => {
       const version = file.match(/^php-(\d+\.\d+\.\d+)/)?.[1] ?? file
-      return item('php', version, architecture, {
-        downloadUrl: `${base}${file}`, fileName: file,
-        note: '官方 NTS ZIP（适合命令行）；官方未提供校验文件，EnvHub 不自动下载。解压后可用「手动登记」纳入管理。'
+      return item('php', version, 'x64', {
+        downloadUrl: `${base}${file}`, fileName: file, pageUrl: 'https://windows.php.net/download/',
+        note: `官方 NTS ZIP（适合命令行）；官方未提供校验文件，EnvHub 不自动下载。解压后可用「手动登记」纳入管理。${armNote}`
       })
-    })
+    }), 'PHP')
 }
 
 // ── Ruby：RubyInstaller 官方安装器 ───────────────────────────────────────────────
@@ -281,7 +312,7 @@ async function rubyCatalog(architecture: Architecture): Promise<RuntimeCatalogIt
       note: '官方 RubyInstaller（.exe）；下载后运行安装，EnvHub 会识别新版本。'
     }))
   }
-  return items.sort((left, right) => compareVersionsDesc(left.version, right.version)).slice(0, 6)
+  return ensureNotEmpty(items.sort((left, right) => compareVersionsDesc(left.version, right.version)).slice(0, 6), 'Ruby')
 }
 
 // ── Git for Windows：官方安装器 ─────────────────────────────────────────────────
@@ -309,10 +340,10 @@ async function gitCatalog(architecture: Architecture): Promise<RuntimeCatalogIte
     }
     if (found.size >= 10) break
   }
-  return [...found.values()].sort((left, right) => compareVersionsDesc(left.version, right.version)).slice(0, 5)
+  return ensureNotEmpty([...found.values()].sort((left, right) => compareVersionsDesc(left.version, right.version)).slice(0, 5), 'Git')
 }
 
-// ── Maven：官方元数据 + archive.apache.org（SHA-512，可应用内安装） ──────────────
+// ── Maven：元数据与发行包都取自 Maven Central（永久保留、速度快），失败再回退 Apache 归档 ──
 async function mavenCatalog(architecture: Architecture): Promise<RuntimeCatalogItem[]> {
   const xml = await fetchText('https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/maven-metadata.xml', 'repo.maven.apache.org')
   const versions = [...xml.matchAll(/<version>([^<]+)<\/version>/g)]
@@ -320,20 +351,30 @@ async function mavenCatalog(architecture: Architecture): Promise<RuntimeCatalogI
     .filter((version) => /^\d+\.\d+\.\d+$/.test(version))
     .sort(compareVersionsDesc)
     .slice(0, 6)
-  return Promise.all(versions.map(async (version) => {
+  const items = await Promise.all(versions.map(async (version) => {
     const major = parts(version)[0] ?? 3
-    const base = `https://archive.apache.org/dist/maven/maven-${major}/${version}/binaries/apache-maven-${version}-bin.zip`
     const fileName = `apache-maven-${version}-bin.zip`
-    try {
-      const checksum = checksumOf('sha512', await fetchText(`${base}.sha512`, 'archive.apache.org'))
-      return item('maven', version, architecture, {
-        downloadUrl: base, fileName, checksum,
-        note: checksum ? '官方 ZIP；下载后会校验 SHA-512，可直接在应用内安装。' : '官方校验值未找到，暂不允许应用内下载。'
-      })
-    } catch {
-      return item('maven', version, architecture, { pageUrl: 'https://maven.apache.org/download.cgi', note: '暂时读不到该版本的校验值，请稍后重试。' })
+    const sources = [
+      { url: `https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${version}/${fileName}`, host: 'repo.maven.apache.org' },
+      { url: `https://archive.apache.org/dist/maven/maven-${major}/${version}/binaries/${fileName}`, host: 'archive.apache.org' }
+    ]
+    for (const source of sources) {
+      try {
+        const checksum = checksumOf('sha512', await fetchText(`${source.url}.sha512`, source.host))
+        if (checksum) {
+          return item('maven', version, architecture, {
+            downloadUrl: source.url, fileName, checksum,
+            note: '官方 ZIP；下载后会校验 SHA-512，可直接在应用内安装。'
+          })
+        }
+      } catch { /* 换下一个来源 */ }
     }
+    return item('maven', version, architecture, {
+      pageUrl: 'https://maven.apache.org/download.cgi',
+      note: '暂时读不到该版本的官方校验值，可在官网页面手动下载。'
+    })
   }))
+  return ensureNotEmpty(items, 'Maven')
 }
 
 // ── Gradle：官方版本 JSON 自带 checksumUrl 与 SHA-256，可应用内安装 ───────────────
@@ -350,14 +391,14 @@ async function gradleCatalog(architecture: Architecture): Promise<RuntimeCatalog
     seen.add(entry.version)
     return true
   })
-  return stable
+  return ensureNotEmpty(stable
     .sort((left, right) => compareVersionsDesc(left.version, right.version))
     .slice(0, 6)
     .map((entry) => item('gradle', entry.version, architecture, {
       downloadUrl: entry.downloadUrl, fileName: `gradle-${entry.version}-bin.zip`,
       checksum: checksumOf('sha256', entry.checksum),
       note: '官方 ZIP；下载后会校验 SHA-256，可直接在应用内安装。'
-    }))
+    })), 'Gradle')
 }
 
 export async function loadCatalog(runtimeId: RuntimeId, architecture: Architecture): Promise<RuntimeCatalogItem[]> {
@@ -381,8 +422,4 @@ export async function loadCatalog(runtimeId: RuntimeId, architecture: Architectu
         note: '该环境由官方安装器维护（EnvHub 只识别已有的安装与版本），请从官网获取。'
       }]
   }
-}
-
-export function catalogSupportsInstall(runtimeId: RuntimeId): boolean {
-  return isInstallableRuntime(runtimeId)
 }

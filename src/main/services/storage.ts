@@ -11,6 +11,7 @@ export interface ManagedRootChangeResult {
   moved: boolean
   rewritten: number
   cleanedPathEntries: number
+  clearedDownloads: number
 }
 
 function emitMoveProgress(percent: number, detail: string): void {
@@ -140,6 +141,7 @@ export async function changeManagedRoot(nextRoot: string, moveExisting: boolean)
 
   let rewritten = 0
   let cleanedPathEntries = 0
+  let clearedDownloads = 0
   if (moved) {
     const fromPrefix = `${normalize(previousRoot)}\\`
     const rewrite = (value: string): string => join(root, value.slice(previousRoot.length).replace(/^[\\/]+/, ''))
@@ -175,10 +177,16 @@ export async function changeManagedRoot(nextRoot: string, moveExisting: boolean)
       ...(backup.previousMachinePath ? { previousMachinePath: replaceRoot(backup.previousMachinePath) } : {}),
       ...(backup.appliedMachinePath ? { appliedMachinePath: replaceRoot(backup.appliedMachinePath) } : {})
     })))
+  } else {
+    // 仅切换：下载文件仍留在旧目录，记录已无从使用（重启后路径会按新目录重算），直接清理并如实告知。
+    const tasks = store.snapshot().downloads
+    const usable = tasks.filter((task) => normalize(task.filePath).startsWith(`${normalize(root)}\\`))
+    clearedDownloads = tasks.length - usable.length
+    if (clearedDownloads) await store.setDownloads(usable)
   }
 
   await mkdir(join(root, 'downloads'), { recursive: true })
-  return { root, moved, rewritten, cleanedPathEntries }
+  return { root, moved, rewritten, cleanedPathEntries, clearedDownloads }
 }
 
 function escapeRegExp(value: string): string {
