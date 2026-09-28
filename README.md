@@ -25,6 +25,26 @@ EnvHub 把这些收进一个界面：扫描出本机有什么、把某个版本�
 - **只认官方源**：版本清单来自各项目官方发布源，下载校验值也只取官方发布的哈希
 - **安装有门槛**：只有官方同时提供 ZIP 归档与校验值（SHA-256 / SHA-512）的环境才开放应用内安装
 
+## 界面
+
+截图取自 0.3.0 的实际界面（示例数据）。
+
+| 概览（浅色） | 概览（深色） |
+| --- | --- |
+| ![概览](docs/images/overview-light.png) | ![概览 深色](docs/images/overview-dark.png) |
+
+| 环境与工具 · 版本与切换 | 环境与工具 · 版本与切换（深色） |
+| --- | --- |
+| ![版本](docs/images/runtimes-versions-light.png) | ![版本 深色](docs/images/runtimes-versions-dark.png) |
+
+| 环境与工具 · 可用版本 | 环境与工具 · 软件源 |
+| --- | --- |
+| ![可用版本](docs/images/runtimes-releases-light.png) | ![软件源](docs/images/runtimes-sources-light.png) |
+
+| 下载 | 设置 |
+| --- | --- |
+| ![下载](docs/images/downloads-light.png) | ![设置](docs/images/settings-light.png) |
+
 ## 功能
 
 | 模块 | 说明 |
