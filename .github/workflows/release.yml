@@ -1,5 +1,8 @@
 name: Release
 
+# 运行标题：默认会显示推送的提交信息（开发用语），这里改成面向仓库访客的写法。
+run-name: 发布 ${{ github.ref_name }}
+
 # 打 v* 标签即自动构建三份 Windows 产物（安装版 / 绿色单文件 / 绿色解压版）并发布到 Releases；
 # 发布说明从 CHANGELOG.md 的「概述 + 亮点」生成，无需手工维护。
 # 也可以在 Actions 页面手动触发（仅构建，不发布，用于验证打包）。
@@ -89,16 +92,17 @@ jobs:
             gh release create $tag $assets --title "EnvHub $env:VERSION" --notes-file release-notes.md
           }
 
-      # 顺手清掉以前失败的运行记录，避免仓库首页 Actions 一栏长期挂着红叉
-      - name: 清理历史失败记录
+      # 只保留最近一次发布记录，避免仓库首页 Actions 一栏堆着历史条目与开发用的提交信息
+      - name: 清理历史运行记录
         if: success() && github.ref_type == 'tag'
         continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $ids = gh api "repos/${{ github.repository }}/actions/workflows/release.yml/runs?per_page=100" --jq '.workflow_runs[] | select(.conclusion == "failure") | .id'
+          $current = "${{ github.run_id }}"
+          $ids = gh api "repos/${{ github.repository }}/actions/workflows/release.yml/runs?per_page=100" --jq ".workflow_runs[] | select(.id != $current) | .id"
           foreach ($id in $ids) {
             gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" | Out-Null
-            "已删除失败运行 $id"
+            "已删除历史运行 $id"
           }
