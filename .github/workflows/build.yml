@@ -11,6 +11,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -28,3 +32,18 @@ jobs:
 
       - name: 类型检查与构建
         run: npm run build
+
+      # 只保留最近一次构建记录，避免 Actions 列表堆积历史条目与开发用的提交信息
+      - name: 清理历史运行记录
+        if: success()
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $current = "${{ github.run_id }}"
+          $ids = gh api "repos/${{ github.repository }}/actions/workflows/build.yml/runs?per_page=100" --jq ".workflow_runs[] | select(.id != $current) | .id"
+          foreach ($id in $ids) {
+            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" | Out-Null
+            "已删除历史运行 $id"
+          }
