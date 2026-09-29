@@ -145,8 +145,17 @@ const packagePresets: Record<string, { label: string; url: string }[]> = {
   ]
 }
 
-const activePackageManager = computed(() => selectedRuntime.value === 'python' ? 'pip' : selectedRuntime.value === 'node' ? 'npm' : selectedRuntime.value === 'maven' ? 'maven' : null)
-const packageManagerLabel = computed(() => activePackageManager.value === 'npm' ? 'npm registry · .npmrc' : activePackageManager.value === 'pip' ? 'pip 镜像 · pip.ini' : 'Maven 镜像 · settings.xml')
+const activePackageManager = computed<'npm' | 'pip' | 'maven' | null>(() => selectedRuntime.value === 'python' ? 'pip' : selectedRuntime.value === 'node' ? 'npm' : selectedRuntime.value === 'maven' ? 'maven' : null)
+// 没有包管理器的环境（Docker、Go、Rust…）返回空串，交给模板显示中性的「软件源」标题，
+// 不能像以前那样落到最后一个分支显示成 Maven。
+const packageManagerLabel = computed(() => {
+  const manager = activePackageManager.value
+  if (manager === 'npm') return 'npm registry · .npmrc'
+  if (manager === 'pip') return 'pip 镜像 · pip.ini'
+  if (manager === 'maven') return 'Maven 镜像 · settings.xml'
+  return ''
+})
+
 
 async function loadPackageConfig(): Promise<void> {
   const manager = activePackageManager.value
@@ -799,7 +808,7 @@ onUnmounted(() => {
                 </section>
 
                 <section v-else-if="detailTab === 'sources'" class="tab-panel">
-                  <div class="tab-panel-heading"><div><h3>{{ packageManagerLabel || '软件源' }}</h3><p>写入用户级配置，仅修改对应配置项，并保留 .bak 备份。</p></div></div>
+                  <div class="tab-panel-heading"><div><h3>{{ packageManagerLabel || '软件源' }}</h3><p v-if="activePackageManager">写入用户级配置，仅修改对应配置项，并保留 .bak 备份。</p><p v-else>该环境暂未提供软件源或本地缓存配置项。</p></div></div>
                   <div v-if="activePackageManager" class="mirror-card surface-card">
                     <div class="mirror-row"><input v-model="packageRegistry" class="mirror-input" spellcheck="false" placeholder="自定义软件源地址" /><button class="small-action" :disabled="packageBusy" @click="testPackageRegistry">测试连接</button><button class="button button-dark small-button" :disabled="packageBusy" @click="applyPackageRegistry()">应用</button></div>
                     <div class="mirror-current">当前：<span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(packageRegistry)">{{ packageRegistry || '未读取' }}</span></div>

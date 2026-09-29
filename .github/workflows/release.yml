@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   release:
@@ -90,19 +89,4 @@ jobs:
             gh release edit $tag --notes-file release-notes.md
           } else {
             gh release create $tag $assets --title "EnvHub $env:VERSION" --notes-file release-notes.md
-          }
-
-      # 只保留最近一次发布记录，避免仓库首页 Actions 一栏堆着历史条目与开发用的提交信息
-      - name: 清理历史运行记录
-        if: success() && github.ref_type == 'tag'
-        continue-on-error: true
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $current = "${{ github.run_id }}"
-          $ids = gh api "repos/${{ github.repository }}/actions/workflows/release.yml/runs?per_page=100" --jq ".workflow_runs[] | select(.id != $current) | .id"
-          foreach ($id in $ids) {
-            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" | Out-Null
-            "已删除历史运行 $id"
           }

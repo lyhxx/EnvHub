@@ -1,6 +1,6 @@
 {
   "name": "envhub",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "productName": "EnvHub",
   "description": "A local development environment manager for Windows",
   "main": "out/main/index.js",

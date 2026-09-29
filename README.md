@@ -3,7 +3,6 @@
 Windows 本地开发环境管理器。集中查看本机已安装的运行时与版本、切换默认版本、按官方源下载安装新版本，并读写包管理器使用的镜像与缓存配置。
 
 <p align="center">
-  <a href="https://github.com/lyhxx/EnvHub/actions/workflows/build.yml"><img src="https://github.com/lyhxx/EnvHub/actions/workflows/build.yml/badge.svg" alt="build"></a>
   <a href="https://github.com/lyhxx/EnvHub/releases"><img src="https://img.shields.io/github/v/release/lyhxx/EnvHub" alt="release"></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078d4" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
@@ -27,7 +26,7 @@ EnvHub 把这些收进一个界面：扫描出本机有什么、把某个版本�
 
 ## 界面
 
-截图取自 0.3.0 的实际界面（示例数据）。
+截图取自 0.3.1 的实际界面（示例数据）。
 
 | 概览（浅色） | 概览（深色） |
 | --- | --- |
@@ -93,9 +92,9 @@ EnvHub 把这些收进一个界面：扫描出本机有什么、把某个版本�
 
 | 类型 | 文件名 | 说明 |
 | --- | --- | --- |
-| 安装版 | `EnvHub-0.3.0-setup.exe` | 安装到系统，可自选安装目录，创建开始菜单快捷方式 |
-| 绿色单文件 | `EnvHub-0.3.0-portable.exe` | 免安装，双击即用 |
-| 绿色解压版 | `EnvHub-0.3.0-win-x64.zip` | 免安装，解压后运行其中的 `EnvHub.exe` |
+| 安装版 | `EnvHub-0.3.1-setup.exe` | 安装到系统，可自选安装目录，创建开始菜单快捷方式 |
+| 绿色单文件 | `EnvHub-0.3.1-portable.exe` | 免安装，双击即用 |
+| 绿色解压版 | `EnvHub-0.3.1-win-x64.zip` | 免安装，解压后运行其中的 `EnvHub.exe` |
 
 三个版本的配置与运行时数据都保存在用户目录（`%APPDATA%\EnvHub` 与 `%LOCALAPPDATA%\EnvHub`），互相共用同一份；系统要求 Windows 10 / 11（x64），程序自带运行时，无需另外安装 Node.js、.NET 或 Python。
 

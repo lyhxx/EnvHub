@@ -245,9 +245,7 @@ src/
 
 `scripts/dist.cjs` 用 `--publish never` 调用 electron-builder：只打包、不发布。electron-builder 会从 git 远端识别出 GitHub 仓库并自行尝试发布，在没有 `GH_TOKEN` 的环境下会在产物构建完成后报错退出，导致构建步骤被判失败——发布统一交给工作流的 `gh release`。
 
-日常校验：`.github/workflows/build.yml` 在推送到 `main` 与 PR 时跑类型检查与编译（`npm ci --ignore-scripts`，不需要 Electron 二进制），README 顶部的 build 徽章即来自它。
-
-两个工作流都用 `run-name` 指定运行标题（否则 GitHub 会拿提交信息当标题，开发用语会直接显示在 Actions 列表里），并在成功后删除自身的历史运行记录，只保留最近一次——想查看历史请用 `git log` 与 Release 页面，需要重跑发布时用 Actions 的 **Re-run jobs**（移动标签会再触发一次完整发布）。
+只有发版这一个工作流：日常提交不跑 CI（需要验证时在 Actions 页面手动触发 release.yml，它只构建、不发布）。工作流用 `run-name` 指定运行标题（否则 GitHub 会拿提交信息当标题，开发用语会直接显示在 Actions 列表里）；需要重跑发布时用 Actions 的 **Re-run jobs**，不要移动标签——移动标签会再触发一次完整发布并新建一条运行记录。
 
 版本号维护：
 
