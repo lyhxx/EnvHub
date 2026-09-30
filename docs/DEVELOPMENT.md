@@ -288,6 +288,8 @@ src/
 
 界面截图放在 `docs/images/`（README 的「界面」一节引用），界面有明显改动后需要重新截图并替换同名文件；截图时不要暴露用户名等本机信息。
 
+README 顶部的徽章：技术栈与版本从 `package.json` 动态读取（shields.io 的 dependency-version / dynamic-json 端点），升级依赖后无需手动改；平台与许可为静态徽章。不放本项目的版本号徽章（shields 缓存会让它停在旧版本，版本以 Releases 页面为准）。
+
 ## 12. 常见问题
 
 | 现象 | 原因 / 处理 |
