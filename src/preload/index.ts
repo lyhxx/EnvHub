@@ -71,6 +71,14 @@ const api: EnvHubApi = {
     enable: () => call('privileged:enable'),
     disable: () => call('privileged:disable')
   },
+  update: {
+    check: (force) => call('update:check', force),
+    download: () => call('update:download'),
+    install: (downloadId) => call('update:install', downloadId),
+    openRelease: () => call('update:open-release'),
+    ignore: (version) => call('update:ignore', version),
+    restore: () => call('update:restore')
+  },
   onSnapshot: (callback) => subscribe('app:snapshot', callback),
   onOperationProgress: (callback) => subscribe('operation:progress', callback),
   onNotice: (callback) => subscribe('app:notice', callback)

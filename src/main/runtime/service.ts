@@ -276,8 +276,18 @@ export async function scanRuntime(): Promise<RuntimeInstallation[]> {
     const currentPath = currentByRuntime.get(item.runtimeId)
     item.isCurrent = currentPath !== undefined && currentPath !== null && normalizePath(item.executablePath) === currentPath
   }
-  await store.setInstallations(deduped)
-  return deduped
+  // 扫描期间用户可能登记、安装或切换了版本：以扫描结果为底，把期间新增的记录并回来，
+  // 并把「默认版本」以最新状态为准（否则整表写回会把用户刚做的操作抹掉）。
+  const latest = store.snapshot().installations
+  const scannedIds = new Set(deduped.map((item) => item.id))
+  const addedDuringScan = latest.filter((item) => !scannedIds.has(item.id))
+  const latestById = new Map(latest.map((item) => [item.id, item]))
+  const merged2 = [...deduped, ...addedDuringScan].map((item) => {
+    const latestItem = latestById.get(item.id)
+    return latestItem ? { ...item, isDefault: latestItem.isDefault } : item
+  })
+  await store.setInstallations(merged2)
+  return merged2
 }
 
 async function resolveCurrentExecutable(runtimeId: RuntimeId, entries: string[]): Promise<string | null> {
@@ -331,7 +341,12 @@ export async function adoptDetectedDirectories(runtimeId: RuntimeId, directories
       break
     }
   }
-  if (added) await store.setInstallations(installations, false)
+  if (added) {
+    // 逐个探测版本可能耗时较久，写回前把期间新增的记录并回来，避免覆盖用户的操作。
+    const latest = store.snapshot().installations
+    const known = new Set(installations.map((item) => item.id))
+    await store.setInstallations([...installations, ...latest.filter((item) => !known.has(item.id))], false)
+  }
   return added
 }
 

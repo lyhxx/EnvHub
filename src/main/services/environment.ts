@@ -129,6 +129,16 @@ export async function readMachinePath(): Promise<string> {
   return (await readEnvironmentSnapshot()).machinePath
 }
 
+// 展开 PATH 里的 %VAR%：只认当前进程环境。注册表里有、但本进程没继承的变量（例如刚写入的 JAVA_HOME）
+// 会展开失败，因此下面判断"目录是否失效"时必须先排除这种条目，不能当成失效目录删掉。
+function hasUnresolvedVariable(value: string): boolean {
+  const lookup = new Set(Object.keys(process.env).map((key) => key.toUpperCase()))
+  for (const match of value.matchAll(/%([^%]+)%/g)) {
+    if (!lookup.has(match[1].toUpperCase())) return true
+  }
+  return false
+}
+
 function expandVariables(value: string): string {
   const lookup = new Map<string, string>()
   for (const [key, entry] of Object.entries(process.env)) {
@@ -345,6 +355,8 @@ export async function repairUserPath(): Promise<RepairResult> {
     const normalized = normalize(expandVariables(entry))
     if (seen.has(normalized)) { removed += 1; continue }
     seen.add(normalized)
+    // 变量展开不出来（注册表里有、本进程没继承）时无法判断目录是否失效，保守保留。
+    if (hasUnresolvedVariable(entry)) { kept.push(entry); continue }
     try {
       await access(expandVariables(entry))
       kept.push(entry)

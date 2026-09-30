@@ -5,8 +5,10 @@ const root = path.resolve(__dirname, '..')
 
 // electron-builder 会从 GitHub 下载 electron / nsis / winCodeSign 等工具包。
 // 本地打包默认走国内镜像（可用环境变量覆盖）；CI 上不要设，直接用 GitHub 更快。
-process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||= process.env.CI ? '' : 'https://npmmirror.com/mirrors/electron-builder-binaries/'
-process.env.ELECTRON_MIRROR ||= process.env.CI ? '' : 'https://npmmirror.com/mirrors/electron/'
+// 只认 CI=true：某些 shell / IDE 会把 CI 设成 "false"，用真值判断会误判成 CI 而把镜像关掉。
+const onCi = process.env.CI === 'true'
+process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||= onCi ? '' : 'https://npmmirror.com/mirrors/electron-builder-binaries/'
+process.env.ELECTRON_MIRROR ||= onCi ? '' : 'https://npmmirror.com/mirrors/electron/'
 if (!process.env.ELECTRON_BUILDER_BINARIES_MIRROR) delete process.env.ELECTRON_BUILDER_BINARIES_MIRROR
 if (!process.env.ELECTRON_MIRROR) delete process.env.ELECTRON_MIRROR
 

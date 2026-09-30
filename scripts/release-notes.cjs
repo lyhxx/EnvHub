@@ -13,6 +13,10 @@ const root = join(__dirname, '..')
 const version = process.argv[2] || require(join(root, 'package.json')).version
 const outIndex = process.argv.indexOf('--out')
 const outFile = outIndex >= 0 ? process.argv[outIndex + 1] : null
+if (outIndex >= 0 && (!outFile || outFile.startsWith('--'))) {
+  console.error('--out 后面缺少文件路径')
+  process.exit(1)
+}
 
 const lines = readFileSync(join(root, 'CHANGELOG.md'), 'utf8').split(/\r?\n/)
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

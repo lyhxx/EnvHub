@@ -5,8 +5,8 @@ import { copyFile, lstat, mkdir, stat, unlink } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import type { ChecksumAlgorithm, DownloadTask, RuntimeCatalogItem } from '../../shared/contracts'
-import { isAllowedDownloadHost } from '../../shared/downloadHosts'
+import type { ChecksumAlgorithm, DownloadTask, FileChecksum, RuntimeCatalogItem } from '../../shared/contracts'
+import { appUpdateHosts, downloadHosts } from '../../shared/downloadHosts'
 import { APP_VERSION } from '../../shared/appInfo'
 import { store } from '../storage/store'
 import { validateProviderAsset } from '../runtime/service'
@@ -38,7 +38,8 @@ function publish(task: DownloadTask): void {
 function update(task: DownloadTask, patch: Partial<DownloadTask>, persist = false): void {
   Object.assign(task, patch, { updatedAt: new Date().toISOString() })
   publish(task)
-  if (persist && store.snapshot().downloads.some((item) => item.id === task.id)) void store.upsertDownload(task)
+  // 落盘失败（磁盘满/权限）不应该变成未处理的 Promise 拒绝；内存状态仍然可用，下次写入会再试。
+  if (persist && store.snapshot().downloads.some((item) => item.id === task.id)) void store.upsertDownload(task).catch(() => undefined)
 }
 
 function safeName(fileName: string): string {
@@ -47,8 +48,18 @@ function safeName(fileName: string): string {
   return `${stem}${ext || '.download'}`
 }
 
-function allowedFinalHost(item: RuntimeCatalogItem, url: string): boolean {
-  return isAllowedDownloadHost(item.runtimeId, url)
+// 运行时归档与 EnvHub 更新包各有自己的主机白名单，首跳与重定向都用任务自身的类型判断。
+function allowedHostsFor(task: DownloadTask): string[] {
+  if (task.kind === 'app') return appUpdateHosts
+  return task.runtimeId ? downloadHosts[task.runtimeId] : []
+}
+
+function isAllowedFinalHost(task: DownloadTask, url: string): boolean {
+  try {
+    return allowedHostsFor(task).includes(new URL(url).hostname.toLowerCase())
+  } catch {
+    return false
+  }
 }
 
 async function hashFile(path: string, algorithm: ChecksumAlgorithm): Promise<string> {
@@ -58,7 +69,7 @@ async function hashFile(path: string, algorithm: ChecksumAlgorithm): Promise<str
   return hash.digest('hex')
 }
 
-async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller: AbortController): Promise<void> {
+async function transfer(task: DownloadTask, controller: AbortController): Promise<void> {
   await ensureDownloadsDirectory()
   let offset = 0
   try {
@@ -69,9 +80,9 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 
-  if (offset > 0 && task.totalBytes !== null && offset === task.totalBytes && item.checksum) {
-    const actual = await hashFile(task.filePath, item.checksum.algorithm)
-    if (actual.toLowerCase() === item.checksum.value) {
+  if (offset > 0 && task.totalBytes !== null && offset === task.totalBytes && task.checksum) {
+    const actual = await hashFile(task.filePath, task.checksum.algorithm)
+    if (actual.toLowerCase() === task.checksum.value) {
       task.receivedBytes = offset
       update(task, { status: 'completed', receivedBytes: offset, totalBytes: offset, speedBytesPerSecond: 0 }, true)
       return
@@ -82,17 +93,23 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
 
   const headers: Record<string, string> = { 'User-Agent': userAgent }
   if (offset > 0) headers.Range = `bytes=${offset}-`
-  let requestUrl = item.downloadUrl!
+  let requestUrl = task.url
   let response: Response | undefined
-  for (let redirects = 0; redirects <= 5; redirects++) {
-    const parsed = new URL(requestUrl)
-    if (parsed.protocol !== 'https:' || !allowedFinalHost(item, requestUrl)) throw new Error('下载重定向到了未授权域名，已阻止')
-    response = await net.fetch(requestUrl, { headers, signal: controller.signal, redirect: 'manual' })
-    if (![301, 302, 303, 307, 308].includes(response.status)) break
-    const location = response.headers.get('location')
-    if (!location || redirects === 5) throw new Error('下载重定向次数过多或缺少目标地址')
-    await response.body?.cancel()
-    requestUrl = new URL(location, requestUrl).toString()
+  // 连接建立后长时间拿不到响应头同样要能收场：否则任务会一直停在"下载中"并占着并发位。
+  const headerTimer = setTimeout(() => { stalled.add(task.id); controller.abort() }, stallTimeout)
+  try {
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      const parsed = new URL(requestUrl)
+      if (parsed.protocol !== 'https:' || !isAllowedFinalHost(task, requestUrl)) throw new Error('下载重定向到了未授权域名，已阻止')
+      response = await net.fetch(requestUrl, { headers, signal: controller.signal, redirect: 'manual' })
+      if (![301, 302, 303, 307, 308].includes(response.status)) break
+      const location = response.headers.get('location')
+      if (!location || redirects === 5) throw new Error('下载重定向次数过多或缺少目标地址')
+      await response.body?.cancel()
+      requestUrl = new URL(location, requestUrl).toString()
+    }
+  } finally {
+    clearTimeout(headerTimer)
   }
   if (!response) throw new Error('下载请求未返回响应')
   if (!response.ok && response.status !== 206) throw new Error(`下载请求失败（HTTP ${response.status}）`)
@@ -141,11 +158,11 @@ async function transfer(task: DownloadTask, item: RuntimeCatalogItem, controller
     clearInterval(stallTimer)
   }
 
-  if (item.checksum) {
-    const actual = await hashFile(task.filePath, item.checksum.algorithm)
-    if (actual.toLowerCase() !== item.checksum.value) {
+  if (task.checksum) {
+    const actual = await hashFile(task.filePath, task.checksum.algorithm)
+    if (actual.toLowerCase() !== task.checksum.value) {
       await unlink(task.filePath).catch(() => undefined)
-      throw new Error(`${item.checksum.algorithm.toUpperCase()} 校验失败，文件已删除`)
+      throw new Error(`${task.checksum.algorithm.toUpperCase()} 校验失败，文件已删除`)
     }
   }
   update(task, { status: 'completed', receivedBytes: task.receivedBytes, totalBytes: task.totalBytes ?? task.receivedBytes, speedBytesPerSecond: 0 }, true)
@@ -164,17 +181,11 @@ function pump(): void {
 }
 
 async function run(task: DownloadTask): Promise<void> {
-  // The task metadata is revalidated by IPC before enqueue. Runtime catalogs are not accepted from arbitrary renderer URLs.
-  const item: RuntimeCatalogItem = {
-    runtimeId: task.runtimeId, version: task.version,
-    architecture: process.arch === 'arm64' ? 'arm64' : 'x64',
-    downloadUrl: task.url, checksum: task.checksum, fileName: task.fileName,
-    pageUrl: '', installSupported: true
-  }
+  // 任务元数据在入队前已由 IPC 校验；这里只按任务自身的类型确定允许的主机。
   const controller = new AbortController()
   active.set(task.id, controller)
   try {
-    await transfer(task, item, controller)
+    await transfer(task, controller)
   } catch (error) {
     if (controller.signal.aborted) {
       // 用户暂停/取消：保持原状态；超时中止：判为失败，保留已下载部分以便续传。
@@ -194,23 +205,58 @@ async function run(task: DownloadTask): Promise<void> {
   }
 }
 
-export async function startDownload(item: RuntimeCatalogItem): Promise<DownloadTask> {
-  validateProviderAsset(item)
+interface EnqueueInput {
+  kind: DownloadTask['kind']
+  runtimeId: DownloadTask['runtimeId']
+  version: string
+  url: string
+  fileName: string
+  checksum?: FileChecksum
+}
+
+// 运行时归档与 EnvHub 更新包共用同一个队列：并发上限、断点续传、卡死看门狗与哈希校验都只有这一份。
+async function enqueue(input: EnqueueInput): Promise<DownloadTask> {
   const pendingCount = store.snapshot().downloads.filter((task) => ['queued', 'downloading', 'paused'].includes(task.status)).length
   if (pendingCount >= 20) throw new Error('下载队列已满，请先完成或取消现有任务')
+  // 同版本重复点下载（连点、切页回来再点）直接复用队列里的任务，不建重复任务；
+  // 已完成/失败/取消的任务不复用，用户仍可重新下载。
+  if (input.kind === 'runtime') {
+    const existing = store.snapshot().downloads.find((task) =>
+      task.kind === 'runtime' && task.runtimeId === input.runtimeId && task.url === input.url &&
+      ['queued', 'downloading', 'paused'].includes(task.status)
+    )
+    if (existing) return existing
+  }
   const id = randomUUID()
-  const fileName = safeName(item.fileName ?? new URL(item.downloadUrl!).pathname.split('/').pop() ?? `${item.runtimeId}-${item.version}.zip`)
+  const fallback = input.kind === 'app' ? `EnvHub-${input.version}.exe` : `${input.runtimeId ?? 'runtime'}-${input.version}.zip`
+  const fileName = safeName(input.fileName || new URL(input.url).pathname.split('/').pop() || fallback)
   const task: DownloadTask = {
-    id, runtimeId: item.runtimeId, version: item.version, url: item.downloadUrl!, fileName,
+    id, kind: input.kind, runtimeId: input.runtimeId, version: input.version, url: input.url, fileName,
     filePath: join(store.snapshot().managedRoot, 'downloads', `${id}-${fileName}`),
     status: 'queued', receivedBytes: 0, totalBytes: null, speedBytesPerSecond: 0,
-    checksum: item.checksum, source: 'internal', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    checksum: input.checksum, source: 'internal', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
   }
   await store.upsertDownload(task)
   pending.add(id)
   publish(task)
   pump()
   return task
+}
+
+export async function startDownload(item: RuntimeCatalogItem): Promise<DownloadTask> {
+  validateProviderAsset(item)
+  return enqueue({
+    kind: 'runtime', runtimeId: item.runtimeId, version: item.version,
+    url: item.downloadUrl!, fileName: item.fileName ?? `${item.runtimeId}-${item.version}.zip`,
+    checksum: item.checksum
+  })
+}
+
+export async function startAppUpdateDownload(input: { version: string; url: string; fileName: string; checksum?: FileChecksum }): Promise<DownloadTask> {
+  return enqueue({
+    kind: 'app', runtimeId: null, version: input.version,
+    url: input.url, fileName: input.fileName, checksum: input.checksum
+  })
 }
 
 export async function pauseDownload(id: string): Promise<void> {
@@ -263,7 +309,7 @@ export async function importDownloadedFile(item: RuntimeCatalogItem): Promise<Do
     throw new Error(`${algorithm.toUpperCase()} 与官方发布值不匹配；导入副本已删除`)
   }
   const task: DownloadTask = {
-    id, runtimeId: item.runtimeId, version: item.version, url: item.downloadUrl ?? item.pageUrl,
+    id, kind: 'runtime', runtimeId: item.runtimeId, version: item.version, url: item.downloadUrl ?? item.pageUrl,
     fileName, filePath, status: 'completed', receivedBytes: stagedInfo.size, totalBytes: stagedInfo.size,
     speedBytesPerSecond: 0, checksum: item.checksum ?? { algorithm: 'sha256', value: actualHash }, source: 'manual',
     warning: item.checksum ? undefined : '没有官方校验值，只记录了本地 SHA-256；来源未经验证。',
@@ -293,7 +339,7 @@ export function recoverDownloads(): void {
       task.status = 'paused'
       task.speedBytesPerSecond = 0
       task.updatedAt = new Date().toISOString()
-      void store.upsertDownload(task)
+      void store.upsertDownload(task).catch(() => undefined)
     }
   }
 }

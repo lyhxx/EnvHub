@@ -10,8 +10,8 @@
   --surface-hover: #f1f3ef;
   --ink: #26342d;
   --ink-strong: #17231d;
-  --muted: #8c9890;
-  --muted-2: #aab2ac;
+  --muted: #6f7a73;
+  --muted-2: #869188;
   --line: #e8ece7;
   --line-strong: #dce3dc;
   --accent: #b6d76c;
@@ -195,7 +195,7 @@ h1 em { color: #779044; font-style: normal; font-weight: 500; }:root[data-theme=
 .operation-body { min-width: 0; flex: 1; }
 .operation-track { height: 3px; margin-top: 8px; overflow: hidden; border-radius: 4px; background: var(--surface-hover); }
 .operation-track i { display: block; height: 100%; border-radius: inherit; background: #94b457; transition: width .3s ease; }
-.custom-tooltip { position: fixed; z-index: 45; max-width: 380px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--ink); background: var(--surface); box-shadow: 0 10px 28px rgba(12, 20, 14, .18); font-size: 11px; line-height: 1.55; white-space: pre-line; pointer-events: none; transform: translate(-50%, calc(-100% - 8px)); }
+.custom-tooltip { position: fixed; z-index: 45; max-width: 380px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--ink); background: var(--surface); box-shadow: 0 10px 28px rgba(12, 20, 14, .18); font-size: 11px; line-height: 1.55; white-space: pre-line; overflow-wrap: anywhere; pointer-events: none; transform: translate(-50%, calc(-100% - 8px)); }
 .custom-tooltip.below { transform: translate(-50%, 8px); }
 .custom-tooltip::after { content: ''; position: absolute; left: 50%; bottom: -5px; width: 8px; height: 8px; border-right: 1px solid var(--line-strong); border-bottom: 1px solid var(--line-strong); background: var(--surface); transform: translateX(-50%) rotate(45deg); }
 .custom-tooltip.below::after { top: -5px; bottom: auto; border: 0; border-left: 1px solid var(--line-strong); border-top: 1px solid var(--line-strong); }
@@ -242,6 +242,39 @@ h1 em { color: #779044; font-style: normal; font-weight: 500; }:root[data-theme=
 .word-cloud-footer > span:nth-child(2) { padding-left: 12px; border-left: 1px solid var(--line-strong); }
 .word-cloud-footer .text-link { margin-left: auto; color: var(--accent-deep); }
 .word-cloud-download { margin-top: 12px; }
+
+/* 设置页的路径列：无空格的 Windows 长路径要能省略，否则会压到右侧按钮上。 */
+.data-path > .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 代理连接指示灯：失败/正常两种状态此前只有文字变了，圆点始终是绿的。 */
+.diagnostic-pulse.pulse-error { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 15%, transparent); }
+.diagnostic-pulse.pulse-good { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 15%, transparent); }
+
+/* 更新横幅（概览页顶部，仅有新版本时出现） */
+.update-banner { display: flex; align-items: flex-start; gap: 13px; margin-bottom: 20px; padding: 14px 15px; border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
+.update-banner-icon { display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; border-radius: 9px; color: var(--accent-deep); background: color-mix(in srgb, var(--accent) 26%, transparent); font-size: 17px; }
+.update-banner-body { min-width: 0; flex: 1; }
+.update-banner-title { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+.update-banner-title b { color: var(--ink-strong); font-size: 14px; }
+.update-banner-title span { color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+.update-banner-notes { margin: 7px 0 0; padding-left: 15px; display: grid; gap: 3px; color: var(--ink); font-size: 12px; line-height: 1.6; }
+.update-banner-notes li { list-style: disc; }
+.update-banner-asset { margin-top: 7px; color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+.update-banner-progress { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
+.update-banner-progress .progress-track { flex: 1; max-width: 320px; }
+.update-banner-progress span { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.update-banner-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.update-banner-actions .quiet-link { padding: 0 2px; }
+.update-banner-more { flex: 0 0 auto; }
+
+.update-notes { margin: 12px 0 0; padding-left: 16px; display: grid; gap: 4px; color: var(--ink); font-size: 12px; line-height: 1.7; }
+.update-notes li { list-style: disc; }
+.update-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 14px; }
+ 
+@media (max-width: 800px) {
+  .update-banner { flex-wrap: wrap; }
+  .update-banner-actions { justify-content: flex-start; }
+}
 
 @media (max-width: 800px) {
   .cloud-page-heading { align-items: flex-start; flex-direction: column; }

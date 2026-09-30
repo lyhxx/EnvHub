@@ -29,6 +29,8 @@ export interface PackageManagerConfig {
   registry: string
   cacheDir?: string
   cacheDirFromFile?: boolean
+  // 配置文件是否真的存在于本机：不存在时界面不展示默认值，避免把"默认约定"显示成"已配置"。
+  configFileExists?: boolean
 }
 
 export interface PathBackup {
@@ -67,9 +69,14 @@ export interface RuntimeCatalogItem {
   note?: string
 }
 
+// 下载任务分两类：运行时的归档（解压后安装），以及 EnvHub 自身的更新包（交给用户手动安装）。
+export type DownloadKind = 'runtime' | 'app'
+export type AppRunForm = 'installer' | 'portable' | 'zip'
+
 export interface DownloadTask {
   id: string
-  runtimeId: RuntimeId
+  kind: DownloadKind
+  runtimeId: RuntimeId | null
   version: string
   url: string
   fileName: string
@@ -110,7 +117,36 @@ export interface AppSnapshot {
   downloads: DownloadTask[]
   managedPaths: Partial<Record<RuntimeId, string>>
   pathBackups: PathBackup[]
+  ignoredUpdateVersions: string[]
   lastScanAt: string | null
+}
+
+export interface AppUpdateAsset {
+  name: string
+  url: string
+  size: number
+  checksum?: FileChecksum
+}
+
+export interface AppUpdateInfo {
+  currentVersion: string
+  latestVersion: string
+  releaseName: string
+  releaseUrl: string
+  publishedAt: string
+  notes: string[]
+  form: AppRunForm
+  asset: AppUpdateAsset | null
+  // 与当前使用形态匹配的产物存在、但缺少官方校验值时的说明；有它就说明「应用内下载」不可用。
+  blockedReason?: string
+  ignored: boolean
+}
+
+export interface AppUpdateState {
+  state: 'idle' | 'latest' | 'available' | 'failed'
+  info?: AppUpdateInfo
+  error?: string
+  checkedAt: string | null
 }
 
 export interface EnvHubApi {
@@ -163,6 +199,14 @@ export interface EnvHubApi {
     status(): Promise<{ enabled: boolean }>
     enable(): Promise<void>
     disable(): Promise<void>
+  }
+  update: {
+    check(force: boolean): Promise<AppUpdateState>
+    download(): Promise<DownloadTask>
+    install(downloadId: string): Promise<{ mode: 'installer' | 'folder' }>
+    openRelease(): Promise<void>
+    ignore(version: string): Promise<void>
+    restore(): Promise<void>
   }
   onSnapshot(callback: (snapshot: AppSnapshot) => void): () => void
   onNotice(callback: (message: string) => void): () => void

@@ -53,7 +53,10 @@ async function prepareBrandedElectron() {
   }
   const sourceStat = await fs.stat(path.join(electronDist, 'electron.exe'))
   const iconStat = await fs.stat(iconPath)
-  const stamp = `host-v1|${sourceStat.size}|${sourceStat.mtimeMs}|${iconStat.mtimeMs}`
+  // stamp 里必须带上"当时有没有 rcedit"：缺 rcedit 时也写了同样的 stamp，
+  // 补装依赖后 electron 解包时间不变，会一直命中旧 stamp，品牌化再也不会重做。
+  const rcedit = findRcedit()
+  const stamp = `host-v2|${sourceStat.size}|${sourceStat.mtimeMs}|${iconStat.mtimeMs}|${rcedit ? 'rcedit' : 'no-rcedit'}`
   try {
     const existingStamp = await fs.readFile(markerPath, 'utf8')
     await fs.access(devExecutable)
@@ -65,9 +68,9 @@ async function prepareBrandedElectron() {
 
   if (!(await fs.stat(devExecutable)).isFile()) throw new Error('无法准备 EnvHub.exe 开发宿主')
 
-  const rceditPath = findRcedit()
+  const rceditPath = rcedit
   if (!rceditPath) {
-    console.warn('未找到 rcedit.exe，跳过开发宿主品牌信息（任务栏可能显示 Electron）。重新执行 npm install 可修复。')
+    console.warn('未找到 rcedit.exe，跳过开发宿主品牌信息（任务栏可能显示 Electron）。执行 npm install 后重跑即可自动重做（stamp 已区分）。')
     await fs.writeFile(markerPath, stamp, 'utf8')
     return
   }

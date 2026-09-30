@@ -117,6 +117,16 @@ function validateCacheDir(value: string): string {
   return dir
 }
 
+// 路径里的 & < > 是合法的 Windows 路径字符，但直接写进 XML 会让 settings.xml 变成非法文件。
+function escapeXml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// 读回来时要还原，否则界面上会显示成 Dev&amp;Cache，再写一次还会二次转义。
+function unescapeXml(value: string): string {
+  return value.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+}
+
 function updateKeyLine(content: string, key: string, value: string): string {
   const lines = content ? content.split(/\r?\n/) : []
   const output: string[] = []
@@ -134,14 +144,15 @@ function updateKeyLine(content: string, key: string, value: string): string {
 }
 
 function updateMavenLocalRepository(content: string, dir: string): string {
+  const value = escapeXml(dir)
   if (/<localRepository>[\s\S]*?<\/localRepository>/i.test(content)) {
-    return content.replace(/<localRepository>[\s\S]*?<\/localRepository>/i, `<localRepository>${dir}</localRepository>`)
+    return content.replace(/<localRepository>[\s\S]*?<\/localRepository>/i, `<localRepository>${value}</localRepository>`)
   }
   if (/<settings[^>]*>/i.test(content)) {
-    return content.replace(/(<settings[^>]*>)/i, `$1\n  <localRepository>${dir}</localRepository>`)
+    return content.replace(/(<settings[^>]*>)/i, `$1\n  <localRepository>${value}</localRepository>`)
   }
   if (!content.trim()) {
-    return `<?xml version="1.0" encoding="UTF-8"?>\n<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">\n  <localRepository>${dir}</localRepository>\n</settings>\n`
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">\n  <localRepository>${value}</localRepository>\n</settings>\n`
   }
   throw new Error('无法识别 settings.xml 结构，请先手动检查该文件')
 }
@@ -173,17 +184,17 @@ function updateIniGlobalKey(content: string, key: string, value: string): string
   return `${output.join('\n').replace(/\n*$/, '')}\n`
 }
 
-async function readConfigFile(manager: PackageManagerId): Promise<{ content: string; encoding: 'utf8' | 'latin1' }> {
+async function readConfigFile(manager: PackageManagerId): Promise<{ content: string; encoding: 'utf8' | 'latin1'; exists: boolean }> {
   try {
     const buffer = await readFile(configFiles[manager])
     try {
-      return { content: new TextDecoder('utf-8', { fatal: true }).decode(buffer), encoding: 'utf8' }
+      return { content: new TextDecoder('utf-8', { fatal: true }).decode(buffer), encoding: 'utf8', exists: true }
     } catch {
       // 文件不是合法 UTF-8（例如 GBK 编码的 settings.xml）：按字节保留，写回时不破坏原编码。
-      return { content: buffer.toString('latin1'), encoding: 'latin1' }
+      return { content: buffer.toString('latin1'), encoding: 'latin1', exists: true }
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { content: '', encoding: 'utf8' }
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { content: '', encoding: 'utf8', exists: false }
     throw error
   }
 }
@@ -211,20 +222,24 @@ function parseRegistry(manager: PackageManagerId, content: string): string | nul
 
 function parseCacheDir(manager: PackageManagerId, content: string): string | null {
   if (manager === 'npm') return content.match(/^\s*cache\s*=\s*(.*?)\s*$/im)?.[1] ?? null
-  if (manager === 'maven') return content.match(/<localRepository>\s*([^<]+?)\s*<\/localRepository>/i)?.[1] ?? null
+  if (manager === 'maven') {
+    const value = content.match(/<localRepository>\s*([^<]+?)\s*<\/localRepository>/i)?.[1]
+    return value ? unescapeXml(value) : null
+  }
   const globalSection = content.match(/^\s*\[global\]\s*$([\s\S]*?)(?=^\s*\[[^\]]+\]\s*$|\s*$)/im)?.[1]
   return globalSection?.match(/^\s*cache-dir\s*=\s*(.*?)\s*$/im)?.[1] ?? null
 }
 
 export async function getPackageConfig(manager: PackageManagerId): Promise<PackageManagerConfig> {
   if (!['npm', 'pip', 'maven'].includes(manager)) throw new Error('不支持的包管理器')
-  const { content } = await readConfigFile(manager)
+  const { content, exists } = await readConfigFile(manager)
   const stored = store.snapshot().packageConfigs[manager]
   const fromFile = parseCacheDir(manager, content)
   return {
     registry: parseRegistry(manager, content) || stored.registry,
     cacheDir: fromFile || stored.cacheDir || defaultCacheDirs[manager],
-    cacheDirFromFile: Boolean(fromFile)
+    cacheDirFromFile: Boolean(fromFile),
+    configFileExists: exists
   }
 }
 
@@ -240,7 +255,7 @@ export async function setPackageRegistry(manager: PackageManagerId, value: strin
   await writeConfigFile(manager, next, encoding)
   const config: PackageManagerConfig = { registry, ...(parseCacheDir(manager, next) ? { cacheDir: parseCacheDir(manager, next)! } : {}) }
   await store.setPackageConfig(manager, config)
-  return { ...config, cacheDir: config.cacheDir ?? defaultCacheDirs[manager], cacheDirFromFile: Boolean(config.cacheDir) }
+  return { ...config, cacheDir: config.cacheDir ?? defaultCacheDirs[manager], cacheDirFromFile: Boolean(config.cacheDir), configFileExists: true }
 }
 
 export async function setPackageCacheDir(manager: PackageManagerId, value: string): Promise<PackageManagerConfig> {
@@ -255,12 +270,13 @@ export async function setPackageCacheDir(manager: PackageManagerId, value: strin
     : manager === 'pip' ? updateIniGlobalKey(previous, 'cache-dir', cacheDir)
       : updateMavenLocalRepository(previous, cacheDir)
   await writeConfigFile(manager, next, encoding)
+  // 存/回传的是未转义的原始路径（文件里那份可能是转义过的 XML 文本）。
   const config: PackageManagerConfig = {
     registry: parseRegistry(manager, next) || store.snapshot().packageConfigs[manager].registry,
-    ...(parseCacheDir(manager, next) ? { cacheDir: parseCacheDir(manager, next)! } : {})
+    cacheDir
   }
   await store.setPackageConfig(manager, config)
-  return { ...config, cacheDir: config.cacheDir ?? defaultCacheDirs[manager], cacheDirFromFile: Boolean(config.cacheDir) }
+  return { ...config, cacheDir, cacheDirFromFile: true, configFileExists: true }
 }
 
 export async function testPackageRegistry(manager: PackageManagerId, value: string): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {

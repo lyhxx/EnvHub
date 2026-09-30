@@ -18,6 +18,7 @@ const initial: AppSnapshot = {
   downloads: [],
   managedPaths: {},
   pathBackups: [],
+  ignoredUpdateVersions: [],
   lastScanAt: null
 }
 
@@ -78,8 +79,12 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
   const downloads: DownloadTask[] = Array.isArray(parsed.downloads) ? parsed.downloads.flatMap((value) => {
     try {
       const item = asObject(value)
-      if (typeof item.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(item.id) || typeof item.runtimeId !== 'string' || !runtimeIds.has(item.runtimeId as never) ||
+      const kind: DownloadTask['kind'] = item.kind === 'app' ? 'app' : 'runtime'
+      if (typeof item.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(item.id) ||
           typeof item.version !== 'string' || typeof item.url !== 'string' || !downloadStatuses.has(String(item.status))) return []
+      if (kind === 'runtime' && (typeof item.runtimeId !== 'string' || !runtimeIds.has(item.runtimeId as never))) return []
+      // 版本号会参与托管目录拼接（runtimes/<环境>/<版本>），先把带路径分隔符之类的奇怪值挡在门外。
+      if (!/^[A-Za-z0-9][A-Za-z0-9.+_@-]{0,99}$/.test(item.version)) return []
       const fileName = safeFileName(item.fileName)
       const source = item.source === 'manual' ? 'manual' : 'internal'
       const receivedBytes = typeof item.receivedBytes === 'number' && Number.isFinite(item.receivedBytes) ? Math.max(0, item.receivedBytes) : 0
@@ -89,7 +94,8 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
         ? { algorithm: String(rawChecksum.algorithm) as FileChecksum['algorithm'], value: rawChecksum.value.toLowerCase() }
         : undefined
       return [{
-        id: item.id, runtimeId: item.runtimeId as DownloadTask['runtimeId'], version: item.version.slice(0, 100),
+        id: item.id, kind, runtimeId: kind === 'runtime' ? item.runtimeId as DownloadTask['runtimeId'] : null,
+        version: item.version.slice(0, 100),
         url: item.url.slice(0, 2048), fileName,
         // Never trust a persisted path; all task I/O is confined to EnvHub's managed download directory.
         filePath: join(managedRoot, 'downloads', `${item.id}-${fileName}`),
@@ -110,6 +116,9 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
       managedPaths[runtimeId as RuntimeInstallation['runtimeId']] = directory
     }
   }
+  const ignoredUpdateVersions = Array.isArray(parsed.ignoredUpdateVersions)
+    ? parsed.ignoredUpdateVersions.flatMap((value) => (typeof value === 'string' && /^\d[\w.+-]{0,39}$/.test(value) ? [value] : [])).slice(-20)
+    : []
   const pathBackups = Array.isArray(parsed.pathBackups) ? parsed.pathBackups.flatMap((value) => {
     try {
       const item = asObject(value)
@@ -127,7 +136,7 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
 
   return {
     ...structuredClone(initial), theme, proxy, packageConfigs, installations, downloads,
-    managedPaths, pathBackups, managedRoot,
+    managedPaths, pathBackups, managedRoot, ignoredUpdateVersions,
     ...(typeof parsed.previousManagedRoot === 'string' && /^[a-zA-Z]:[\\/]/.test(parsed.previousManagedRoot) && !parsed.previousManagedRoot.includes('..')
       ? { previousManagedRoot: parsed.previousManagedRoot.replace(/[\\/]+$/, '').slice(0, 2048) }
       : {}),
@@ -140,6 +149,8 @@ export class JsonStore {
   private readonly filePath = join(app.getPath('userData'), 'db.json')
   private writeQueue: Promise<void> = Promise.resolve()
   private preserveBackupOnNextWrite = false
+  // 上一次成功写出的完整内容（含加载时的规范化结果），备份只从这里取。
+  private backupSource: string | null = null
   private listeners = new Set<(snapshot: AppSnapshot) => void>()
 
   // 唯一的变更出口：任何写入完成后通知订阅者（主进程据此向界面广播）。
@@ -166,10 +177,13 @@ export class JsonStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         this.preserveBackupOnNextWrite = true
+        // 先把损坏的文件改名留档，再回退到备份：否则接下来的写盘会把它覆盖掉，事后无从诊断。
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+        await rename(this.filePath, `${this.filePath}.corrupt-${stamp}`).catch(() => undefined)
         try {
           this.data = normalizeSnapshot(await readJson(`${this.filePath}.bak`))
         } catch {
-          // Preserve the damaged file for diagnosis; start with safe defaults.
+          // 备份也不可用时从默认值开始；损坏文件与备份都保留在磁盘上。
         }
       }
     }
@@ -225,6 +239,18 @@ export class JsonStore {
 
   async removeInstallation(id: string): Promise<void> {
     this.data.installations = this.data.installations.filter((item) => item.id !== id)
+    await this.persist()
+  }
+
+  // 用户点过「忽略此版本」的版本号；用数组而不是单个字段，避免某个版本被撤回后 latest 回退又提示一遍。
+  async ignoreUpdateVersion(version: string): Promise<void> {
+    if (!this.data.ignoredUpdateVersions.includes(version)) this.data.ignoredUpdateVersions.push(version)
+    this.data.ignoredUpdateVersions = this.data.ignoredUpdateVersions.slice(-20)
+    await this.persist()
+  }
+
+  async restoreUpdateVersions(): Promise<void> {
+    this.data.ignoredUpdateVersions = []
     await this.persist()
   }
 
@@ -288,13 +314,15 @@ export class JsonStore {
     const backup = `${this.filePath}.bak`
     const content = `${JSON.stringify(this.data, null, 2)}\n`
     const write = async (): Promise<void> => {
-      if (!this.preserveBackupOnNextWrite) {
-        try { await writeFile(backup, await readFile(this.filePath)) }
-        catch { /* First launch or no previous file. */ }
+      // 备份只写"上一次由本进程成功写出的内容"，不再复制磁盘上的 db.json：
+      // 否则运行期被外部写坏的文件会被当成健康内容覆盖掉真正的备份。
+      if (!this.preserveBackupOnNextWrite && this.backupSource !== null) {
+        try { await writeFile(backup, this.backupSource) } catch { /* 备份失败不影响主写入 */ }
       }
       this.preserveBackupOnNextWrite = false
       await writeFile(temporary, content, 'utf8')
       await rename(temporary, this.filePath)
+      this.backupSource = content
     }
     this.writeQueue = this.writeQueue.then(write, write)
     await this.writeQueue

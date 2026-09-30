@@ -10,6 +10,7 @@ import { getPackageConfig, setPackageCacheDir, setPackageRegistry, testPackageRe
 import { applyDefaultVersion, disablePrivilegedHelper, enablePrivilegedHelper, privilegedHelperStatus, repairUserPath, takeOverMachinePriority, undoLastPathChange } from './services/environment'
 import { changeManagedRoot } from './services/storage'
 import { installDownloadedRuntime, uninstallManagedRuntime } from './services/install'
+import { checkForUpdate, downloadAppUpdate, ignoreUpdateVersion, installAppUpdate, openReleasePage, restoreIgnoredUpdateVersions } from './services/updater'
 
 function assertTrustedSender(event: Electron.IpcMainInvokeEvent): void {
   if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) throw new Error('仅允许主窗口页面发起调用')
@@ -113,6 +114,8 @@ export function registerIpc(): void {
     if (typeof id !== 'string' || id.length > 80) throw new Error('无效的安装记录')
     const installation = store.snapshot().installations.find((item) => item.id === id)
     if (!installation) throw new Error('找不到该环境记录')
+    // 必须先拦：applyDefaultVersion 会写 PATH 与 JAVA_HOME，等 store.activate 再报错就已经改坏环境了。
+    if (installation.runtimeId === 'jdk' && installation.javaKind === 'jre') throw new Error('JRE 不包含编译器，不能设为默认 JDK')
     const result = await applyDefaultVersion(installation)
     await store.activate(id)
     // 写入 PATH 可能顺带移除了其他运行时的托管目录，必须整体重算"当前使用"，否则别的运行时标记会一直停在旧值。
@@ -144,6 +147,8 @@ export function registerIpc(): void {
   })
   register('runtime:install', async (_event, downloadId: string, activate: boolean) => {
     if (typeof downloadId !== 'string' || downloadId.length > 80) throw new Error('无效的下载任务')
+    const task = store.snapshot().downloads.find((item) => item.id === downloadId)
+    if (task?.kind === 'app') throw new Error('这是 EnvHub 的更新包，请用更新入口安装')
     const installation = await installDownloadedRuntime(downloadId, activate === true)
     return installation
   })
@@ -212,6 +217,12 @@ export function registerIpc(): void {
   register('privileged:status', () => privilegedHelperStatus())
   register('privileged:enable', () => enablePrivilegedHelper())
   register('privileged:disable', () => disablePrivilegedHelper())
+  register('update:check', (_event, force: boolean) => checkForUpdate(force === true))
+  register('update:download', () => downloadAppUpdate())
+  register('update:install', (_event, downloadId: string) => installAppUpdate(assertRecordId(downloadId)))
+  register('update:open-release', () => openReleasePage())
+  register('update:ignore', (_event, version: string) => ignoreUpdateVersion(version))
+  register('update:restore', () => restoreIgnoredUpdateVersions())
   register('network:set-proxy', async (_event, settings) => {
     if (!settings || !['system', 'direct', 'manual'].includes(settings.mode) || typeof settings.server !== 'string' || settings.server.length > 300) {
       throw new Error('代理设置无效')

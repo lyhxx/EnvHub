@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { Directive } from 'vue'
-import type { AppSnapshot, DownloadTask, ProxyStatus, RuntimeCatalogItem, RuntimeId, RuntimeInstallation, ThemeMode } from '../../shared/contracts'
+import type { AppSnapshot, AppUpdateInfo, AppUpdateState, DownloadTask, ProxyStatus, RuntimeCatalogItem, RuntimeId, RuntimeInstallation, ThemeMode } from '../../shared/contracts'
 import { runtimeMeta, runtimeGroups } from '../../shared/runtimeMeta'
 import { isInstallableRuntime } from '../../shared/installable'
 import { sameVersion } from '../../shared/versions'
+import { updateFormLabel, matchesUpdateAsset } from '../../shared/update'
 import { APP_STAGE, APP_VERSION } from '../../shared/appInfo'
 import brandMark from './assets/brand/envhub-mark.png'
 
@@ -26,6 +27,7 @@ const catalog = ref<RuntimeCatalogItem[]>([])
 const packageRegistry = ref('')
 const packageCacheDir = ref('')
 const packageCacheDirFromFile = ref(false)
+const packageConfigFileExists = ref(false)
 const installingTaskId = ref('')
 const helperEnabled = ref(false)
 const packageBusy = ref(false)
@@ -38,6 +40,12 @@ const manualProxyServer = ref('')
 const proxyModeDraft = ref<'manual' | null>(null)
 const shownProxyMode = computed(() => proxyModeDraft.value ?? snapshot.value?.proxy.mode ?? 'system')
 const notice = ref('')
+// 更新提示：「取消」只收起本次运行，「忽略此版本」写进本地数据（设置页可恢复）。
+const updateState = ref<AppUpdateState | null>(null)
+const updateChecking = ref(false)
+const updateBusy = ref(false)
+const updateBannerHidden = ref(false)
+const installingUpdateId = ref('')
 const tooltip = ref<{ text: string; x: number; y: number; below: boolean } | null>(null)
 const operation = ref<{ title: string; detail?: string; percent?: number } | null>(null)
 let operationDepth = 0
@@ -57,6 +65,14 @@ function closeConfirm(ok: boolean): void {
   confirmResolver = null
   resolver?.(ok)
 }
+
+// 对话框：打开时把焦点移进去（否则键盘 Tab 会跑到被遮住的背景控件上），并支持 Esc 关闭。
+const confirmCard = ref<HTMLElement | null>(null)
+watch(confirmDialog, async (value) => {
+  if (!value) return
+  await nextTick()
+  confirmCard.value?.focus()
+})
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 let unsubscribeDownloads: (() => void) | undefined
 let unsubscribeSnapshot: (() => void) | undefined
@@ -86,13 +102,74 @@ const groupedRuntimes = computed(() => runtimeGroups
 const selectedInstallations = computed(() => installations.value.filter((item) => item.runtimeId === selectedRuntime.value))
 const currentInstallation = computed(() => selectedInstallations.value.find((item) => item.isCurrent))
 const resolvedCurrentPath = ref<string | null>(null)
+// 异步请求的归属校验：快速切换运行时/页面时，先发后回的旧结果不能覆盖当前选中的内容。
+let catalogRequestId = 0
+let resolvedPathRequestId = 0
+let packageConfigRequestId = 0
 
 async function refreshResolvedPath(): Promise<void> {
-  try { resolvedCurrentPath.value = (await window.envhub.runtime.resolveCurrent(selectedRuntime.value)).path }
-  catch { resolvedCurrentPath.value = null }
+  const requestId = ++resolvedPathRequestId
+  const runtimeId = selectedRuntime.value
+  try {
+    const path = (await window.envhub.runtime.resolveCurrent(runtimeId)).path
+    if (requestId !== resolvedPathRequestId || runtimeId !== selectedRuntime.value) return
+    resolvedCurrentPath.value = path
+  } catch {
+    if (requestId === resolvedPathRequestId) resolvedCurrentPath.value = null
+  }
 }
 const formattedScan = computed(() => snapshot.value?.lastScanAt ? new Date(snapshot.value.lastScanAt).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '尚未扫描')
 const downloadDirectory = computed(() => snapshot.value?.managedRoot ? `${snapshot.value.managedRoot}\\downloads` : '')
+const updateInfo = computed<AppUpdateInfo | null>(() => updateState.value?.state === 'available' ? updateState.value.info ?? null : null)
+const showUpdateBanner = computed(() => Boolean(updateInfo.value && !updateInfo.value.ignored && !updateBannerHidden.value))
+const updateTask = computed<DownloadTask | null>(() => {
+  const info = updateInfo.value
+  if (!info) return null
+  return downloads.value.find((task) => task.kind === 'app' && sameVersion(task.version, info.latestVersion)) ?? null
+})
+const ignoredUpdateVersions = computed(() => snapshot.value?.ignoredUpdateVersions ?? [])
+const updateCheckText = computed(() => {
+  const state = updateState.value
+  if (!state) return '尚未检查'
+  if (state.state === 'failed') return state.error ?? '检查失败'
+  if (state.state === 'latest') return `已是最新版本（${state.info?.latestVersion ?? APP_VERSION}）`
+  const info = state.info
+  if (!info) return '发现新版本'
+  return info.ignored ? `已忽略 ${info.latestVersion}` : `可更新到 ${info.latestVersion}`
+})
+const updateCheckedText = computed(() => {
+  const checkedAt = updateState.value?.checkedAt
+  if (!checkedAt) return '尚未检查'
+  return new Date(checkedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+})
+const updateAssetText = computed(() => {
+  const info = updateInfo.value
+  if (!info) return ''
+  if (!info.asset) return info.blockedReason ?? '这个版本暂不支持应用内下载'
+  return `${info.asset.name}（${updateFormLabel(info.form)}，${formatBytes(info.asset.size)}）`
+})
+// 按钮文案按"任务自己的产物名"判断，不能依赖 updateInfo（启动后 6 秒内它还是空的，
+// 那时下载页里的按钮会显示成"打开所在文件夹"，实际点下去却是"退出并安装"）。
+function updateActionLabel(task: DownloadTask): string {
+  if (installingUpdateId.value === task.id) return '正在启动…'
+  return matchesUpdateAsset(task.fileName, 'installer') ? '退出并安装' : '打开所在文件夹'
+}
+const updateFormText = computed(() => updateState.value?.info ? updateFormLabel(updateState.value.info.form) : '—')
+
+function taskTitle(task: DownloadTask): string {
+  if (task.kind === 'app') return 'EnvHub'
+  return runtimeMeta.find((item) => item.id === task.runtimeId)?.name ?? '运行时'
+}
+
+const updateTaskStatusText = computed(() => {
+  const task = updateTask.value
+  if (!task) return ''
+  if (task.status === 'completed') return '更新包已下载完成'
+  if (task.status === 'failed') return task.error ?? '下载失败'
+  if (task.status === 'paused') return '下载已暂停'
+  if (task.status === 'cancelled') return '下载已取消'
+  return `正在下载更新包 ${formatBytes(task.receivedBytes)}${task.totalBytes ? ` / ${formatBytes(task.totalBytes)}` : ''}`
+})
 
 function versionsFor(runtimeId: RuntimeId): RuntimeInstallation[] {
   return installations.value.filter((item) => item.runtimeId === runtimeId)
@@ -155,17 +232,37 @@ const packageManagerLabel = computed(() => {
   if (manager === 'maven') return 'Maven 镜像 · settings.xml'
   return ''
 })
+// 没装这个工具、本机也没有它的配置文件时，不显示默认镜像与缓存地址：
+// 那是"约定"而不是"配置"，摆出来只会让人以为已经配好了。
+const packageConfigReady = computed(() => Boolean(activePackageManager.value) &&
+  (selectedInstallations.value.length > 0 || packageConfigFileExists.value))
+const packageConfigTarget = computed(() => {
+  const manager = activePackageManager.value
+  if (manager === 'npm') return 'npm registry 与缓存目录'
+  if (manager === 'pip') return 'pip 镜像与缓存目录'
+  if (manager === 'maven') return 'Maven 镜像与本地仓库'
+  return ''
+})
+const packagePresetList = computed(() => {
+  const manager = activePackageManager.value
+  return manager ? packagePresets[manager] : []
+})
 
 
 async function loadPackageConfig(): Promise<void> {
   const manager = activePackageManager.value
-  if (!manager) { packageRegistry.value = ''; packageCacheDir.value = ''; return }
+  const requestId = ++packageConfigRequestId
+  if (!manager) { packageRegistry.value = ''; packageCacheDir.value = ''; packageCacheDirFromFile.value = false; packageConfigFileExists.value = false; return }
   try {
     const config = await window.envhub.packages.getConfig(manager)
+    if (requestId !== packageConfigRequestId || manager !== activePackageManager.value) return
     packageRegistry.value = config.registry
     packageCacheDir.value = config.cacheDir ?? ''
     packageCacheDirFromFile.value = config.cacheDirFromFile === true
-  } catch (error) { say(error instanceof Error ? error.message : '读取镜像配置失败') }
+    packageConfigFileExists.value = config.configFileExists === true
+  } catch (error) {
+    if (requestId === packageConfigRequestId) say(error instanceof Error ? error.message : '读取镜像配置失败')
+  }
 }
 
 async function applyPackageCacheDir(): Promise<void> {
@@ -336,11 +433,20 @@ const vTip: Directive<HTMLElement, string> = {
       if (!text) return
       const rect = el.getBoundingClientRect()
       const below = rect.top < 56
-      tooltip.value = { text, x: rect.left + rect.width / 2, y: below ? rect.bottom : rect.top, below }
+      // 提示框宽 380px，这里把中心点钳进视口，避免贴边时被裁掉一半。
+      const half = 190
+      const x = Math.min(Math.max(rect.left + rect.width / 2, half + 8), window.innerWidth - half - 8)
+      tooltip.value = { text, x, y: below ? rect.bottom : rect.top, below }
     }
     if (binding.value) el.dataset.tip = ''
+    // 图标按钮（···、×、↗）只有符号，键盘与读屏需要名字：没显式写 aria-label 就用提示文案兜底。
+    const label = el.getAttribute('aria-label') || el.dataset.tip || binding.value
+    if (label && !el.getAttribute('aria-label')) el.setAttribute('aria-label', label)
     el.addEventListener('mouseenter', entry.show)
     el.addEventListener('mouseleave', entry.hide)
+    // 键盘聚焦时也要能看到提示：disabled 的按钮不会触发鼠标事件，所以提示文案同时进了 aria-label。
+    el.addEventListener('focusin', entry.show)
+    el.addEventListener('focusout', entry.hide)
     el.addEventListener('mousedown', entry.hide)
     tipStore.set(el, entry)
   },
@@ -353,6 +459,8 @@ const vTip: Directive<HTMLElement, string> = {
     if (!entry) return
     el.removeEventListener('mouseenter', entry.show)
     el.removeEventListener('mouseleave', entry.hide)
+    el.removeEventListener('focusin', entry.show)
+    el.removeEventListener('focusout', entry.hide)
     el.removeEventListener('mousedown', entry.hide)
     tipStore.delete(el)
   }
@@ -375,7 +483,7 @@ function onOperationProgress(payload: { percent: number; detail: string }): void
   if (!operation.value.detail || !payload.detail.startsWith('正在复制')) operation.value.detail = payload.detail
 }
 
-async function withOperation<T>(title: string, detail: string | undefined, task: () => Promise<T>, delayMs = 320): Promise<T> {
+async function withOperation<T>(title: string, detail: string | undefined, task: () => Promise<T>, delayMs = 320, onTimeout?: () => void): Promise<T> {
   // operationDepth 只有在真正 beginOperation 之后才成对释放，否则会把别的操作的提示条提前收掉。
   let began = false
   let finished = false
@@ -395,6 +503,8 @@ async function withOperation<T>(title: string, detail: string | undefined, task:
     if (Date.now() - start > 60_000) {
       clearInterval(watchdog)
       if (began) { began = false; endOperation() }
+      // 调用方要把自己的 loading 标志一起复位，否则按钮会永远停在"进行中"。
+      onTimeout?.()
       say('操作耗时超出预期，已停止等待；结果可能稍后自动生效', 4000)
     }
   }, 2000)
@@ -406,7 +516,7 @@ async function withOperation<T>(title: string, detail: string | undefined, task:
 }
 
 function formatBytes(value: number | null | undefined): string {
-  if (!value) return '—'
+  if (value === null || value === undefined) return '—'
   const units = ['B', 'KB', 'MB', 'GB']
   let size = value
   let unit = 0
@@ -428,11 +538,15 @@ function applyTheme(theme: ThemeMode | undefined): void {
   if (!theme) return
   const dark = theme === 'dark' || (theme === 'system' && systemThemeQuery.matches)
   document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+  // 记下实际明暗，下次启动由 main.ts 先铺底，避免深色用户看到一闪的浅色。
+  window.localStorage.setItem('envhub.theme', dark ? 'dark' : 'light')
 }
 
 watch(() => snapshot.value?.theme, applyTheme, { immediate: true })
 watch([page, selectedRuntime], () => {
   clearNotice()
+  // 离开设置页就丢弃"自定义代理"的草稿态，避免回来时卡片高亮与真实模式不一致。
+  proxyModeDraft.value = null
   if (page.value === 'runtimes') {
     void loadPackageConfig()
     void syncCurrentFlags()
@@ -444,13 +558,20 @@ watch(detailTab, () => { clearNotice() })
 function onSystemThemeChange(): void { if (snapshot.value?.theme === 'system') applyTheme('system') }
 
 async function loadCatalog(): Promise<void> {
+  const requestId = ++catalogRequestId
+  const runtimeId = selectedRuntime.value
   catalogLoading.value = true
   catalog.value = []
   void loadPackageConfig()
   try {
-    catalog.value = await withOperation('正在读取官方版本列表', '从官方源获取版本与校验信息', () => window.envhub.runtime.catalog(selectedRuntime.value), 600)
-  } catch (error) { say(error instanceof Error ? error.message : '暂时无法读取版本信息') }
-  finally { catalogLoading.value = false }
+    const items = await withOperation('正在读取官方版本列表', '从官方源获取版本与校验信息', () => window.envhub.runtime.catalog(runtimeId), 600,
+      () => { if (requestId === catalogRequestId) catalogLoading.value = false })
+    if (requestId !== catalogRequestId || runtimeId !== selectedRuntime.value) return
+    catalog.value = items
+  } catch (error) {
+    if (requestId === catalogRequestId && runtimeId === selectedRuntime.value) say(error instanceof Error ? error.message : '暂时无法读取版本信息')
+  }
+  finally { if (requestId === catalogRequestId) catalogLoading.value = false }
 }
 
 async function scan(): Promise<void> {
@@ -459,7 +580,7 @@ async function scan(): Promise<void> {
     await withOperation('正在扫描本机环境', '读取 PATH 与常见安装目录中的版本信息', async () => {
       await window.envhub.runtime.scan()
       snapshot.value = await window.envhub.app.getSnapshot()
-    })
+    }, 320, () => { scanning.value = false })
     await refreshResolvedPath()
     say('扫描完成，已更新本机环境清单')
   } catch (error) { say(error instanceof Error ? error.message : '扫描失败') }
@@ -518,8 +639,9 @@ async function activate(item: RuntimeInstallation): Promise<void> {
 
 async function installTask(task: DownloadTask): Promise<void> {
   if (installingTaskId.value) return
+  if (task.kind !== 'runtime' || !task.runtimeId) return
   installingTaskId.value = task.id
-  const runtimeName = runtimeMeta.find((runtime) => runtime.id === task.runtimeId)?.name ?? task.runtimeId
+  const runtimeName = runtimeMeta.find((runtime) => runtime.id === task.runtimeId)?.name ?? '运行时'
   beginOperation(`正在安装 ${runtimeName} ${task.version}`, '解压到托管目录并校验可执行文件，请稍候')
   try {
     const installation = await window.envhub.runtime.install(task.id, false)
@@ -598,7 +720,80 @@ async function copyTaskLink(task: DownloadTask): Promise<void> {
   } catch { say('复制失败，请稍后重试') }
 }
 
+async function checkUpdate(force: boolean, announce = false): Promise<void> {
+  if (updateChecking.value) return
+  updateChecking.value = true
+  try {
+    updateState.value = await window.envhub.update.check(force)
+    if (announce) {
+      const state = updateState.value
+      if (state.state === 'available' && state.info) say(`发现新版本 ${state.info.latestVersion}`)
+      else if (state.state === 'latest') say('已是最新版本')
+      else say(state.error ?? '检查更新失败')
+    }
+  } catch (error) {
+    if (announce) say(error instanceof Error ? error.message : '检查更新失败')
+  } finally { updateChecking.value = false }
+}
+
+async function downloadUpdate(): Promise<void> {
+  updateBusy.value = true
+  try {
+    await window.envhub.update.download()
+    snapshot.value = await window.envhub.app.getSnapshot()
+    say('更新包已加入下载队列，可在下载页查看进度')
+  } catch (error) { say(error instanceof Error ? error.message : '无法下载更新包') }
+  finally { updateBusy.value = false }
+}
+
+async function installUpdate(task: DownloadTask): Promise<void> {
+  if (installingUpdateId.value) return
+  if (matchesUpdateAsset(task.fileName, 'installer')) {
+    const confirmed = await askConfirm({
+      title: '安装 EnvHub 更新？',
+      lines: [
+        'EnvHub 会先退出，然后启动安装程序；安装完成后会自动重新打开。',
+        '已安装的运行环境与清单都在本机数据目录里，更新不会改动它们。',
+        'Windows 可能会要求你确认安装程序的来源。'
+      ],
+      confirmText: '退出并安装'
+    })
+    if (!confirmed) return
+  }
+  installingUpdateId.value = task.id
+  try {
+    const result = await window.envhub.update.install(task.id)
+    if (result.mode === 'installer') say('安装程序已启动，EnvHub 即将退出…', 4000)
+    else say('已打开更新包所在文件夹，替换（或直接使用）新文件即可')
+  } catch (error) { say(error instanceof Error ? error.message : '无法启动安装程序') }
+  finally { installingUpdateId.value = '' }
+}
+
+async function ignoreUpdate(version: string): Promise<void> {
+  try {
+    await window.envhub.update.ignore(version)
+    updateBannerHidden.value = true
+    await checkUpdate(false)
+    say(`已忽略 ${version}；更高的版本发布后仍会提示`, 3200)
+  } catch (error) { say(error instanceof Error ? error.message : '忽略失败') }
+}
+
+async function restoreIgnoredUpdates(): Promise<void> {
+  try {
+    await window.envhub.update.restore()
+    updateBannerHidden.value = false
+    await checkUpdate(true)
+    say('已恢复更新提示')
+  } catch (error) { say(error instanceof Error ? error.message : '恢复失败') }
+}
+
+async function openReleasePage(): Promise<void> {
+  try { await window.envhub.update.openRelease() }
+  catch (error) { say(error instanceof Error ? error.message : '无法打开发布页面') }
+}
+
 function isInstalled(task: DownloadTask): boolean {
+  if (task.kind !== 'runtime' || !task.runtimeId) return false
   return installations.value.some((item) => item.source === 'managed' && item.runtimeId === task.runtimeId && sameVersion(item.version, task.version))
 }
 
@@ -685,6 +880,8 @@ onMounted(async () => {
     void loadProxy()
     void loadHelperStatus()
     void syncCurrentFlags()
+    // 启动后等首屏扫描安静下来再检查更新；失败不打扰用户，只有手动检查才回报结果。
+    window.setTimeout(() => { void checkUpdate(false) }, 6000)
   } catch (error) { say(error instanceof Error ? error.message : 'EnvHub 初始化失败') }
   unsubscribeDownloads = window.envhub.download.onUpdate((task) => {
     if (!snapshot.value) return
@@ -745,6 +942,35 @@ onUnmounted(() => {
         <transition name="page" mode="out-in">
         <div :key="page" :class="{ 'page-transition-fill': page === 'runtimes' }">
         <section v-if="page === 'overview'" class="page-content">
+          <section v-if="showUpdateBanner && updateInfo" class="update-banner surface-card">
+            <div class="update-banner-icon">↑</div>
+            <div class="update-banner-body">
+              <div class="update-banner-title"><b>EnvHub {{ updateInfo.latestVersion }} 可用</b><span>当前 {{ updateInfo.currentVersion }} · {{ updateInfo.publishedAt ? new Date(updateInfo.publishedAt).toLocaleDateString('zh-CN') : '' }}</span></div>
+              <ul v-if="updateInfo.notes.length" class="update-banner-notes"><li v-for="line in updateInfo.notes" :key="line">{{ line }}</li></ul>
+              <div v-if="updateTask" class="update-banner-progress">
+                <div class="progress-track"><i :class="{ indeterminate: !updateTask.totalBytes && updateTask.status === 'downloading' }" :style="{ width: `${updateTask.totalBytes ? progress(updateTask) : 30}%` }"></i></div>
+                <span>{{ updateTaskStatusText }}</span>
+              </div>
+              <div v-else-if="updateAssetText" class="update-banner-asset">{{ updateAssetText }}</div>
+            </div>
+            <div class="update-banner-actions">
+              <template v-if="updateTask && updateTask.status === 'completed'">
+                <button class="button button-dark small-button" :disabled="installingUpdateId === updateTask.id" @click="installUpdate(updateTask)">{{ updateActionLabel(updateTask) }}</button>
+              </template>
+              <template v-else-if="updateTask && ['paused', 'failed', 'cancelled'].includes(updateTask.status)">
+                <button class="button button-dark small-button" @click="resumeTask(updateTask.id)">继续下载</button>
+              </template>
+              <template v-else-if="updateTask">
+                <button class="button button-outline small-button" @click="page = 'downloads'">查看下载</button>
+              </template>
+              <template v-else>
+                <button class="button button-dark small-button" :disabled="updateBusy || !updateInfo.asset?.checksum" v-tip="updateInfo.blockedReason ?? ''" @click="downloadUpdate">应用内下载</button>
+              </template>
+              <button class="button button-outline small-button" @click="openReleasePage">浏览器下载 ↗</button>
+              <button class="quiet-link" @click="updateBannerHidden = true">取消</button>
+            </div>
+            <button class="more-action update-banner-more" v-tip data-tip="忽略此版本（设置里可恢复）" @click="ignoreUpdate(updateInfo.latestVersion)">···</button>
+          </section>
           <div class="cloud-page-heading">
             <div><div class="eyebrow"><span class="eyebrow-line"></span> TOOLCHAIN CLOUD</div><h1>开发环境</h1></div>
             <button class="button button-outline" :disabled="scanning" @click="scan">{{ scanning ? '扫描中…' : '扫描本机环境' }} <span>↻</span></button>
@@ -758,7 +984,7 @@ onUnmounted(() => {
             </div>
             <footer class="word-cloud-footer"><span><span class="status-led" :class="snapshot?.lastScanAt ? 'led-on' : ''"></span>{{ snapshot?.lastScanAt ? `最近扫描 · ${formattedScan}` : '尚未扫描' }}</span><span>{{ installedCount }} 个版本</span><button class="text-link" @click="page = 'runtimes'">打开环境库 <span>→</span></button></footer>
           </section>
-          <button v-if="activeDownloads" class="download-summary surface-card word-cloud-download" @click="page = 'downloads'"><span class="download-summary-icon">↓</span><span class="download-summary-copy"><b>{{ activeDownloads }} 个下载任务进行中</b><small>{{ activeDownloadTasks.map(task => `${runtimeMeta.find(item => item.id === task.runtimeId)?.name} ${task.version}`).join(' · ') }}</small></span><span class="download-summary-link">查看队列 →</span></button>
+          <button v-if="activeDownloads" class="download-summary surface-card word-cloud-download" @click="page = 'downloads'"><span class="download-summary-icon">↓</span><span class="download-summary-copy"><b>{{ activeDownloads }} 个下载任务进行中</b><small>{{ activeDownloadTasks.map(task => `${taskTitle(task)} ${task.version}`).join(' · ') }}</small></span><span class="download-summary-link">查看队列 →</span></button>
         </section>
 
         <section v-else-if="page === 'runtimes'" class="page-content runtimes-page">
@@ -808,14 +1034,15 @@ onUnmounted(() => {
                 </section>
 
                 <section v-else-if="detailTab === 'sources'" class="tab-panel">
-                  <div class="tab-panel-heading"><div><h3>{{ packageManagerLabel || '软件源' }}</h3><p v-if="activePackageManager">写入用户级配置，仅修改对应配置项，并保留 .bak 备份。</p><p v-else>该环境暂未提供软件源或本地缓存配置项。</p></div></div>
-                  <div v-if="activePackageManager" class="mirror-card surface-card">
+                  <div class="tab-panel-heading"><div><h3>{{ packageManagerLabel || '软件源' }}</h3><p v-if="activePackageManager && packageConfigReady">写入用户级配置，仅修改对应配置项，并保留 .bak 备份。</p><p v-else-if="activePackageManager">本机还没检测到 {{ selectedMeta.name }}，先安装或用「＋ 手动登记」登记后再配置。</p><p v-else>该环境暂未提供软件源或本地缓存配置项。</p></div></div>
+                  <div v-if="packageConfigReady" class="mirror-card surface-card">
                     <div class="mirror-row"><input v-model="packageRegistry" class="mirror-input" spellcheck="false" placeholder="自定义软件源地址" /><button class="small-action" :disabled="packageBusy" @click="testPackageRegistry">测试连接</button><button class="button button-dark small-button" :disabled="packageBusy" @click="applyPackageRegistry()">应用</button></div>
                     <div class="mirror-current">当前：<span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(packageRegistry)">{{ packageRegistry || '未读取' }}</span></div>
-                    <div class="mirror-presets"><button v-for="preset in packagePresets[activePackageManager]" :key="preset.url" :class="['mirror-preset', { chosen: packageRegistry.startsWith(preset.url.replace(/\/$/, '')) }]" @click="applyPackageRegistry(preset.url)">{{ preset.label }}</button></div>
+                    <div class="mirror-presets"><button v-for="preset in packagePresetList" :key="preset.url" :class="['mirror-preset', { chosen: packageRegistry.startsWith(preset.url.replace(/\/$/, '')) }]" @click="applyPackageRegistry(preset.url)">{{ preset.label }}</button></div>
                     <div class="mirror-row mirror-cache"><input v-model="packageCacheDir" class="mirror-input" spellcheck="false" placeholder="本地缓存 / 仓库路径，例如 D:\\DevCache" /><button class="button button-dark small-button" :disabled="packageBusy" @click="applyPackageCacheDir">应用路径</button></div>
                     <div class="mirror-current">{{ activePackageManager === 'npm' ? 'npm cache 目录' : activePackageManager === 'pip' ? 'pip cache-dir 目录' : 'Maven localRepository' }}：<span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(packageCacheDir)">{{ packageCacheDir || '未读取' }}</span> <span v-if="packageCacheDir" class="mirror-tag">{{ packageCacheDirFromFile ? '已配置' : '默认位置' }}</span></div>
                   </div>
+                  <div v-else-if="activePackageManager" class="empty-state surface-card"><div class="empty-art"><span>{{ selectedMeta.glyph }}</span><i>?</i></div><h3>尚未检测到 {{ selectedMeta.name }}</h3><p>本机没有找到 {{ selectedMeta.name }}，所以不显示默认的镜像与缓存地址——那只是工具的默认约定，不是你的配置。安装或用「＋ 手动登记」登记之后，这里才会显示 {{ packageConfigTarget }} 设置。</p><button class="button button-soft" @click="detailTab = 'releases'">查看可用版本</button></div>
                   <div v-else class="empty-state surface-card"><div class="empty-art"><span>{{ selectedMeta.glyph }}</span><i>·</i></div><h3>{{ selectedMeta.name }} 暂无可配置的软件源</h3><p>该环境暂未提供软件源或本地缓存配置项。</p></div>
                 </section>
 
@@ -843,8 +1070,8 @@ onUnmounted(() => {
           <div class="download-list surface-card" v-if="downloads.length">
             <article v-for="task in downloads" :key="task.id" class="download-row">
               <div class="download-file-icon" :class="statusClass(task.status)">{{ task.status === 'completed' ? '✓' : task.status === 'failed' ? '!' : '↓' }}</div>
-              <div class="download-content"><div class="download-title-row"><div class="download-title">{{ runtimeMeta.find(item => item.id === task.runtimeId)?.name }} <span>{{ task.version }}</span></div><span :class="['task-status', statusClass(task.status)]">{{ statusLabel(task.status) }}</span></div><div class="download-progress-line"><div class="progress-track large-progress"><i :class="{ indeterminate: !task.totalBytes && task.status === 'downloading' }" :style="{ width: `${task.totalBytes ? progress(task) : 30}%` }"></i></div><span>{{ formatBytes(task.receivedBytes) }}<template v-if="task.totalBytes"> / {{ formatBytes(task.totalBytes) }}</template></span></div><div v-if="task.error" class="download-error">{{ task.error }}</div><div v-else-if="task.warning" class="download-warning">{{ task.warning }}</div><div class="download-meta"><span class="mono copyable" v-tip="`${task.filePath}\n点击复制`" @click="copyPath(task.filePath)">{{ task.source === 'manual' ? (task.warning ? '浏览器下载 · 仅本地校验' : '浏览器下载 · 已校验') : task.status === 'downloading' ? `${formatBytes(task.speedBytesPerSecond)}/s` : task.fileName }}</span><span v-if="task.status === 'downloading' && task.totalBytes">{{ progress(task) }}%</span><span v-else class="mono">{{ new Date(task.createdAt).toLocaleDateString('zh-CN') }}</span></div></div>
-              <div class="download-actions"><button v-if="task.status === 'downloading' || task.status === 'queued'" class="small-action" @click="pauseTask(task.id)">暂停</button><button v-else-if="['paused', 'failed', 'cancelled'].includes(task.status)" class="small-action" @click="resumeTask(task.id)">{{ task.status === 'failed' ? '重试 / 续传' : '继续下载' }}</button><button v-if="task.status === 'completed' && isInstallableRuntime(task.runtimeId) && !isInstalled(task)" class="button button-dark small-button" :disabled="Boolean(installingTaskId)" @click="installTask(task)">{{ installingTaskId === task.id ? '安装中…' : '安装' }}</button><span v-else-if="task.status === 'completed' && isInstalled(task)" class="installed-hint">已安装</span><button v-if="!['completed', 'cancelled'].includes(task.status)" class="more-action" v-tip data-tip="取消并保留已下载部分" @click="cancelTask(task.id)">×</button><button class="more-action" v-tip data-tip="复制来源链接" @click="copyTaskLink(task)">↗</button><button class="more-action" v-tip data-tip="删除任务" @click="removeTask(task)">✕</button></div>
+              <div class="download-content"><div class="download-title-row"><div class="download-title">{{ taskTitle(task) }} <span>{{ task.version }}</span><span v-if="task.kind === 'app'" class="source-badge">更新包</span></div><span :class="['task-status', statusClass(task.status)]">{{ statusLabel(task.status) }}</span></div><div class="download-progress-line"><div class="progress-track large-progress"><i :class="{ indeterminate: !task.totalBytes && task.status === 'downloading' }" :style="{ width: `${task.totalBytes ? progress(task) : 30}%` }"></i></div><span>{{ formatBytes(task.receivedBytes) }}<template v-if="task.totalBytes"> / {{ formatBytes(task.totalBytes) }}</template></span></div><div v-if="task.error" class="download-error">{{ task.error }}</div><div v-else-if="task.warning" class="download-warning">{{ task.warning }}</div><div class="download-meta"><span class="mono copyable" v-tip="`${task.filePath}\n点击复制`" @click="copyPath(task.filePath)">{{ task.source === 'manual' ? (task.warning ? '浏览器下载 · 仅本地校验' : '浏览器下载 · 已校验') : task.status === 'downloading' ? `${formatBytes(task.speedBytesPerSecond)}/s` : task.fileName }}</span><span v-if="task.status === 'downloading' && task.totalBytes">{{ progress(task) }}%</span><span v-else class="mono">{{ new Date(task.createdAt).toLocaleDateString('zh-CN') }}</span></div></div>
+              <div class="download-actions"><button v-if="task.status === 'downloading' || task.status === 'queued'" class="small-action" @click="pauseTask(task.id)">暂停</button><button v-else-if="['paused', 'failed', 'cancelled'].includes(task.status)" class="small-action" @click="resumeTask(task.id)">{{ task.status === 'failed' ? '重试 / 续传' : '继续下载' }}</button><button v-if="task.status === 'completed' && task.kind === 'runtime' && task.runtimeId && isInstallableRuntime(task.runtimeId) && !isInstalled(task)" class="button button-dark small-button" :disabled="Boolean(installingTaskId)" @click="installTask(task)">{{ installingTaskId === task.id ? '安装中…' : '安装' }}</button><span v-else-if="task.status === 'completed' && task.kind === 'runtime' && isInstalled(task)" class="installed-hint">已安装</span><button v-if="task.status === 'completed' && task.kind === 'app'" class="button button-dark small-button" :disabled="installingUpdateId === task.id" @click="installUpdate(task)">{{ updateActionLabel(task) }}</button><button v-if="!['completed', 'cancelled'].includes(task.status)" class="more-action" v-tip data-tip="取消并保留已下载部分" @click="cancelTask(task.id)">×</button><button class="more-action" v-tip data-tip="复制来源链接" @click="copyTaskLink(task)">↗</button><button class="more-action" v-tip data-tip="删除任务" @click="removeTask(task)">✕</button></div>
             </article>
           </div>
           <div v-else class="empty-download surface-card"><div class="download-empty-orbit"><span>↓</span><i></i></div><h2>下载列表是空的</h2><p>在环境与工具库选择版本开始下载，或复制官方直链后用浏览器下载。</p><button class="button button-dark" @click="page = 'runtimes'">浏览可用版本 <span>→</span></button></div>
@@ -864,6 +1091,32 @@ onUnmounted(() => {
                 <div v-if="shownProxyMode === 'manual'" class="manual-proxy"><label for="proxy-server">代理服务器地址</label><div class="input-action"><input id="proxy-server" v-model="manualProxyServer" placeholder="http://127.0.0.1:7890" /><button class="button button-dark small-button" :disabled="busy" @click="saveProxy('manual')">应用</button></div><small>例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。暂不保存代理账号密码。</small></div>
                 <div class="proxy-diagnostic"><span :class="['diagnostic-pulse', { 'pulse-error': proxyStatus?.reachable === false, 'pulse-good': proxyStatus?.reachable }]" ></span><div><b>连接路由</b><small>{{ proxyStatus?.resolution ?? '正在读取代理解析结果…' }}<template v-if="proxyStatus?.reachable"> · {{ proxyStatus.latencyMs }} ms</template><template v-else-if="proxyStatus?.reachable === false"> · {{ proxyStatus.testError }}</template></small></div><button class="quiet-link" :disabled="testingProxy" @click="testProxy">{{ testingProxy ? '检测中…' : '连接测试 ↻' }}</button></div>
               </section>
+              <section class="settings-card surface-card"><div class="settings-card-heading"><div class="settings-icon">↑</div><div><h3>关于与更新</h3><p>检查本仓库 GitHub Releases 上的正式版本；更新包在应用内下载后由你确认安装。</p></div><span class="settings-live" :class="{ 'is-off': !updateState || updateState.state === 'failed' }"><i></i>{{ updateState?.state === 'available' ? '有新版本' : updateState?.state === 'latest' ? '已是最新' : updateState?.state === 'failed' ? '检查失败' : '尚未检查' }}</span></div>
+                <div class="data-path"><span>当前版本</span><span class="mono">{{ APP_VERSION }} · {{ APP_STAGE }}</span><span class="data-desc">使用形态：{{ updateFormText }}</span></div>
+                <div class="data-path"><span>线上版本</span><span class="mono">{{ updateState?.info?.latestVersion ?? '—' }}</span><button class="quiet-link" :disabled="updateChecking" @click="checkUpdate(true, true)">{{ updateChecking ? '检查中…' : '检查更新 ↻' }}</button></div>
+                <div class="data-path"><span>检查结果</span><span class="data-desc">{{ updateCheckText }}</span><span class="data-desc">{{ updateCheckedText }}</span></div>
+                <template v-if="updateInfo">
+                  <ul v-if="updateInfo.notes.length" class="update-notes"><li v-for="line in updateInfo.notes" :key="line">{{ line }}</li></ul>
+                  <div class="update-actions">
+                    <template v-if="updateTask && updateTask.status === 'completed'">
+                      <button class="button button-dark small-button" :disabled="installingUpdateId === updateTask.id" @click="installUpdate(updateTask)">{{ updateActionLabel(updateTask) }}</button>
+                    </template>
+                    <template v-else-if="updateTask && ['paused', 'failed', 'cancelled'].includes(updateTask.status)">
+                      <button class="button button-dark small-button" @click="resumeTask(updateTask.id)">继续下载</button>
+                    </template>
+                    <template v-else-if="updateTask">
+                      <button class="button button-outline small-button" @click="page = 'downloads'">查看下载进度</button>
+                    </template>
+                    <template v-else>
+                      <button class="button button-dark small-button" :disabled="updateBusy || !updateInfo.asset?.checksum" v-tip="updateInfo.blockedReason ?? ''" @click="downloadUpdate">应用内下载</button>
+                    </template>
+                    <button class="button button-outline small-button" @click="openReleasePage">打开发布页面 ↗</button>
+                    <span v-if="updateInfo.asset" class="data-desc">{{ updateAssetText }}</span>
+                  </div>
+                </template>
+                <div v-if="ignoredUpdateVersions.length" class="update-actions"><span class="data-desc">已忽略：<span class="mono">{{ ignoredUpdateVersions.join('、') }}</span></span><button class="quiet-link" @click="restoreIgnoredUpdates">恢复提示 ↻</button></div>
+                <div class="settings-foot">更新包来自本仓库的 GitHub Releases，下载后按官方 SHA-256 校验；不会静默安装，也不会改动已装好的运行环境与清单。</div>
+              </section>
               <section class="settings-card surface-card"><div class="settings-card-heading"><div class="settings-icon">⌂</div><div><h3>本机数据</h3><p>运行时、下载文件和清单都存在本机；可以换到其他磁盘。</p></div></div><div class="data-path"><span>数据目录</span><span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(snapshot?.managedRoot ?? '')">{{ snapshot?.managedRoot }}</span><button class="quiet-link" @click="changeStorageRoot">更改 →</button></div><div class="data-path"><span>下载目录</span><span class="mono copyable" v-tip data-tip="点击复制" @click="copyPath(downloadDirectory)">{{ downloadDirectory }}</span><button class="quiet-link" @click="openDownloadDirectory">打开 →</button></div><div v-if="snapshot?.pathBackups?.length" class="data-path"><span>PATH 备份</span><span class="data-desc">最近一次修改 · <span class="mono">{{ new Date(snapshot.pathBackups[snapshot.pathBackups.length - 1].at).toLocaleString('zh-CN') }}</span></span><button class="quiet-link" @click="undoLastPathChange">撤销修改 →</button></div><div class="data-path"><span>环境变量</span><span class="data-desc">清理用户 PATH 中的重复项与失效目录</span><button class="quiet-link" @click="repairPath">修复 PATH →</button></div><div class="settings-foot">不创建账户或上传扫描清单。在线查询时仅请求官方公开版本目录。</div></section>
             </div>
           </div>
@@ -872,7 +1125,7 @@ onUnmounted(() => {
         </transition>
       </div>
     </main>
-    <transition name="modal"><div v-if="confirmDialog" class="modal-backdrop" @click.self="closeConfirm(false)"><div class="modal-card" role="dialog" aria-modal="true"><h3>{{ confirmDialog.title }}</h3><p v-for="line in confirmDialog.lines" :key="line" class="modal-line">{{ line }}</p><div class="modal-actions"><button class="button button-outline" @click="closeConfirm(false)">{{ confirmDialog.cancelText ?? '取消' }}</button><button :class="['button', confirmDialog.danger ? 'button-danger' : 'button-dark']" @click="closeConfirm(true)">{{ confirmDialog.confirmText ?? '确定' }}</button></div></div></div></transition>
+    <transition name="modal"><div v-if="confirmDialog" class="modal-backdrop" @click.self="closeConfirm(false)" @keydown.esc="closeConfirm(false)"><div ref="confirmCard" class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title" tabindex="-1"><h3 id="confirm-title">{{ confirmDialog.title }}</h3><p v-for="line in confirmDialog.lines" :key="line" class="modal-line">{{ line }}</p><div class="modal-actions"><button class="button button-outline" @click="closeConfirm(false)">{{ confirmDialog.cancelText ?? '取消' }}</button><button :class="['button', confirmDialog.danger ? 'button-danger' : 'button-dark']" @click="closeConfirm(true)">{{ confirmDialog.confirmText ?? '确定' }}</button></div></div></div></transition>
     <transition name="toast"><div v-if="tooltip" :class="['custom-tooltip', { below: tooltip.below }]" :style="{ left: `${tooltip.x}px`, top: `${tooltip.y}px` }">{{ tooltip.text }}</div></transition>
     <transition name="toast"><div v-if="operation" class="operation-banner"><span class="loader"></span><div class="operation-body"><b>{{ operation.title }}</b><small v-if="operation.detail">{{ operation.detail }}</small><div v-if="typeof operation.percent === 'number'" class="operation-track"><i :style="{ width: `${operation.percent}%` }"></i></div></div></div></transition>
     <transition name="toast"><div v-if="notice" class="toast-message"><span>✳</span>{{ notice }}</div></transition>

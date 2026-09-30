@@ -24,3 +24,15 @@ export function isAllowedDownloadHost(runtimeId: RuntimeId, url: string): boolea
     return false
   }
 }
+
+// EnvHub 自身的更新包来自本仓库的 GitHub Releases，与 JDK / Gradle / Bun 等环境的来源是同一批主机。
+export const appUpdateRepository = 'lyhxx/EnvHub'
+export const appUpdateHosts = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']
+
+export function isAllowedAppUpdateHost(url: string): boolean {
+  try {
+    return appUpdateHosts.includes(new URL(url).hostname.toLowerCase())
+  } catch {
+    return false
+  }
+}

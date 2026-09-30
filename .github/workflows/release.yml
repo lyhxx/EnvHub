@@ -26,10 +26,17 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: 校验标签与 package.json 版本一致
+      - name: 校验标签与版本号一致
         shell: pwsh
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          # appInfo.ts 的 APP_VERSION 也要一起校验：它决定关于页显示的版本与更新检查的基准，
+          # 忘了同步就会发出"界面显示旧版本、更新检查永远提示有新版本"的包。
+          $appVersion = (Select-String -Path src/shared/appInfo.ts -Pattern "APP_VERSION\s*=\s*'([^']+)'" | Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $appVersion) { throw "无法从 src/shared/appInfo.ts 读取 APP_VERSION" }
+          if ($appVersion -ne $version) {
+            throw "package.json 的版本 $version 与 appInfo.ts 的 APP_VERSION $appVersion 不一致"
+          }
           if ("${{ github.ref_type }}" -eq "tag") {
             if ("v$version" -ne "${{ github.ref_name }}") {
               throw "标签 ${{ github.ref_name }} 与 package.json 的版本 $version 不一致"
@@ -72,7 +79,8 @@ jobs:
         run: node scripts/release-notes.cjs $env:VERSION --out release-notes.md
 
       - name: 发布到 Releases
-        if: github.ref_type == 'tag'
+        # 只有"推标签"才发布：手动触发时即使把 ref 选成标签也不会发版，与开发文档的说明一致。
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

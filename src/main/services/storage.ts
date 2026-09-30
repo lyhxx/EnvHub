@@ -118,21 +118,38 @@ export async function changeManagedRoot(nextRoot: string, moveExisting: boolean)
       }
       throw new Error(`目标目录中已存在非空的 ${child} 文件夹：${to}\n请清空它，或改选其他目录`)
     }
-    for (const child of children) {
-      const from = join(previousRoot, child)
-      const to = join(root, child)
-      try { await access(from) } catch { continue }
-      try {
-        await rename(from, to)
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOTEMPTY') {
-          // 跨盘或无法原子重命名：降级为带进度的复制 + 删除源目录。
-          await copyTreeWithProgress(from, to, child)
-        } else {
-          throw new Error(`移动 ${child} 失败：${code ?? '未知错误'}`)
+    const movedChildren: string[] = []
+    try {
+      for (const child of children) {
+        const from = join(previousRoot, child)
+        const to = join(root, child)
+        try { await access(from) } catch { continue }
+        try {
+          await rename(from, to)
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOTEMPTY') {
+            // 跨盘或无法原子重命名：降级为带进度的复制 + 删除源目录。
+            await copyTreeWithProgress(from, to, child)
+          } else {
+            throw new Error(`移动 ${child} 失败：${code ?? '未知错误'}`)
+          }
         }
+        movedChildren.push(child)
       }
+    } catch (error) {
+      // 半迁移是最糟的状态：文件已经在新目录、配置还指着旧目录，界面会像"版本全丢了"。
+      // 这里把已经搬过去的子目录逐个搬回来，保证"要么整体切换成功、要么维持原状"。
+      const stuck: string[] = []
+      for (const child of [...movedChildren].reverse()) {
+        try { await rename(join(root, child), join(previousRoot, child)) }
+        catch { stuck.push(join(root, child)) }
+      }
+      const detail = error instanceof Error ? error.message : String(error)
+      if (stuck.length) {
+        throw new Error(`${detail}\n其余内容已放回原目录，但下面这些需要你手动移回 ${previousRoot}：\n${stuck.join('\n')}`)
+      }
+      throw new Error(`${detail}\n数据目录未切换，原有内容已放回 ${previousRoot}`)
     }
     moved = true
   }
